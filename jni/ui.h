@@ -80,7 +80,7 @@ static void RunQueued(bool gameIsRunning) {
 
 // ---------------------------------------------------------------- state
 static float g_sc = 1.f;                          // UI scale (screen height / 1080)
-static float g_slop = 36.f;                       // finger jitter allowed before a tap becomes a drag
+static float g_slop = 48.f;                       // finger jitter allowed before a tap becomes a drag (pixels)
 static float g_scrW = 0.f, g_scrH = 0.f, g_fabD = 100.f;
 static volatile float g_fabX = 0.f, g_fabY = 0.f; // top-left of the floating button (written by touch thread while dragging)
 static bool g_posInit = false;
@@ -89,6 +89,7 @@ static bool g_open = false;
 static float g_openAnim = 0.f, g_idle = 0.f, g_fade = 1.f;
 static float g_btnAlpha = 0.92f, g_btnScale = 1.f;
 static bool g_fadeIdle = true;
+static bool g_lockPos = false;                    // when on, the floating button cannot be dragged
 static int g_tab = 0;
 static char g_toast[64] = "";
 static float g_toastT = 0.f;
@@ -97,6 +98,7 @@ static float g_toastT = 0.f;
 static int g_dbgGameState = -1, g_dbgCheatsFound = 0;
 static bool g_canRun = false;                     // game is in "playing" state
 static volatile int g_dbgTouches = 0, g_dbgTaps = 0;
+static volatile int g_dbgRaw[4] = {0, 0, 0, 0};   // raw event counts by type (1 = up, 2 = down, 3 = move)
 
 // ------------------------------------------------------------ touch input
 // Touch events arrive on the game's input callback, drawing happens on the render
@@ -116,7 +118,7 @@ static bool g_moved = false, g_scrollArea = false;
 static int g_downId = 0;
 static float g_scrollDy = 0.f, g_velY = 0.f;
 static volatile float g_fling = 0.f;
-static double g_lastMoveT = 0.0;
+static double g_lastMoveT = 0.0, g_lastEventT = 0.0;
 static volatile bool g_fabTap = false, g_saveReq = false;
 static int g_tapQ[8];
 static volatile int g_tqH = 0, g_tqT = 0;
@@ -149,36 +151,46 @@ static bool HitFab(float x, float y) {
     return dx * dx + dy * dy <= r * r;
 }
 
+// Touch event types of the game's AND_TouchEvent(type, finger, x, y).
+// Read out of the original menu's touch hook:  1 = finger UP,  2 = finger DOWN,  3 = MOVE.
+enum { kTouchUp = 1, kTouchDown = 2, kTouchMove = 3 };
+
+static void ResetFinger() { g_finger = -1; g_target = 0; g_downId = 0; g_moved = false; }
+
 // returns true when the touch belongs to the menu and must NOT reach the game
-// type: 1 = down, 2 = move, 3 = up  (same codes the original menu uses)
 static bool OnTouch(int type, int idx, int x, int y) {
+    if (type >= 1 && type <= 3) g_dbgRaw[type] = g_dbgRaw[type] + 1;
     if (!g_visible) return false;
     const float fx = (float)x, fy = (float)y;
 
-    if (type == 1) {
-        if (g_finger >= 0) return false;
+    if (type == kTouchDown) {
+        if (g_finger == idx) ResetFinger();            // we missed its UP: start over
+        if (g_finger >= 0) return false;               // one menu finger at a time
         int target = 0, id = 0;
         if (HitFab(fx, fy)) target = 1;
         else if (g_panelValid && InRect(fx, fy, g_pX0, g_pY0, g_pX1, g_pY1)) { target = 2; id = FindId(fx, fy); }
-        if (!target) return false;
+        if (!target) return false;                     // not ours: the game gets it
         g_finger = idx; g_target = target;
         g_downX = g_lastX = fx; g_downY = g_lastY = fy;
         g_startFabX = g_fabX; g_startFabY = g_fabY;
         g_moved = false; g_downId = id;
         g_scrollArea = (target == 2) && InRect(fx, fy, g_cX0, g_cY0, g_cX1, g_cY1);
-        g_velY = 0.f; g_fling = 0.f; g_lastMoveT = Now();
+        g_velY = 0.f; g_fling = 0.f; g_lastMoveT = g_lastEventT = Now();
         g_dbgTouches = g_dbgTouches + 1;
         return true;
     }
-    if (idx != g_finger) return false;
+    if (idx != g_finger) return false;                 // some other finger: the game's business
+    g_lastEventT = Now();
 
-    if (type == 2) {
+    if (type == kTouchMove) {
         const float mx = fx - g_downX, my = fy - g_downY;
         if (!g_moved && mx * mx + my * my > g_slop * g_slop) g_moved = true;
         if (g_moved) {
             if (g_target == 1) {
-                g_fabX = Clamp(g_startFabX + mx, 0.f, g_scrW - g_fabD);
-                g_fabY = Clamp(g_startFabY + my, 0.f, g_scrH - g_fabD);
+                if (!g_lockPos) {
+                    g_fabX = Clamp(g_startFabX + mx, 0.f, g_scrW - g_fabD);
+                    g_fabY = Clamp(g_startFabY + my, 0.f, g_scrH - g_fabD);
+                }
             } else if (g_scrollArea) {
                 const double t = Now();
                 float dtm = (float)(t - g_lastMoveT);
@@ -195,7 +207,7 @@ static bool OnTouch(int type, int idx, int x, int y) {
         return true;
     }
 
-    if (type == 3) {
+    if (type == kTouchUp) {
         if (!g_moved) {
             if (g_target == 1) g_fabTap = true;
             else {
@@ -203,11 +215,11 @@ static bool OnTouch(int type, int idx, int x, int y) {
                 if (id && id == g_downId) PushTap(id);
             }
         } else if (g_target == 1) {
-            g_saveReq = true;                          // remember where the button was dropped
+            if (!g_lockPos) g_saveReq = true;          // remember where the button was dropped
         } else if (g_scrollArea && (Now() - g_lastMoveT) < 0.08) {
             g_fling = g_velY;                          // let the list glide on
         }
-        g_finger = -1; g_target = 0; g_downId = 0;
+        ResetFinger();
         return true;
     }
     return false;
@@ -215,7 +227,7 @@ static bool OnTouch(int type, int idx, int x, int y) {
 
 // called by main.cpp every frame before Draw()
 static void SetVisible(bool visible) {
-    if (g_visible && !visible && g_finger >= 0) { g_finger = -1; g_target = 0; g_downId = 0; }
+    if (g_visible && !visible && g_finger >= 0) ResetFinger();
     g_visible = visible;
     if (!visible) g_panelValid = false;
 }
@@ -232,11 +244,12 @@ static void LoadConfig() {
         snprintf(path, sizeof(path), "%s/config.txt", kCfgDirs[i]);
         FILE* f = fopen(path, "r");
         if (!f) continue;
-        float fx, fy, a, s; int fade;
-        if (fscanf(f, "%f %f %f %f %d", &fx, &fy, &a, &s, &fade) == 5) {
+        float fx, fy, a, s; int fade, lock = 0;
+        if (fscanf(f, "%f %f %f %f %d %d", &fx, &fy, &a, &s, &fade, &lock) >= 5) {
             g_cfgFx = Clamp(fx, 0.f, 1.f); g_cfgFy = Clamp(fy, 0.f, 1.f);
             g_btnAlpha = Clamp(a, 0.15f, 1.f); g_btnScale = Clamp(s, 0.7f, 1.5f);
             g_fadeIdle = fade != 0;
+            g_lockPos = lock != 0;
         }
         fclose(f);
         return;
@@ -250,7 +263,7 @@ static void SaveConfig(float W, float H) {
         snprintf(path, sizeof(path), "%s/config.txt", kCfgDirs[i]);
         FILE* f = fopen(path, "w");
         if (!f) continue;
-        fprintf(f, "%.5f %.5f %.3f %.3f %d\n", g_fabX / W, g_fabY / H, g_btnAlpha, g_btnScale, g_fadeIdle ? 1 : 0);
+        fprintf(f, "%.5f %.5f %.3f %.3f %d %d\n", g_fabX / W, g_fabY / H, g_btnAlpha, g_btnScale, g_fadeIdle ? 1 : 0, g_lockPos ? 1 : 0);
         fclose(f);
         return;
     }
@@ -258,7 +271,7 @@ static void SaveConfig(float W, float H) {
 
 static void Init(float scale) {
     g_sc = scale;
-    g_slop = 36.f * scale;
+    g_slop = fmaxf(40.f, 48.f * scale);
     ImGuiStyle& st = ImGui::GetStyle();
     ImGui::StyleColorsDark();
     st.WindowRounding = 28.f * scale;
@@ -359,6 +372,7 @@ static void Draw(float W, float H, float dt) {
     g_rectsBuild.clear();
     g_dbgTaps = g_dbgTaps + g_nFired;
 
+    if (g_finger >= 0 && Now() - g_lastEventT > 5.0) ResetFinger();      // lost UP event: never stay stuck
     if (g_fabTap) { g_fabTap = false; g_open = !g_open; Toast(""); }
     if (g_saveReq) { g_saveReq = false; SaveConfig(W, H); }
 
@@ -435,7 +449,7 @@ static void Draw(float W, float H, float dt) {
     ImGui::SetCursorPos(ImVec2(18.f * sc, (hh - ImGui::GetFontSize()) * 0.5f));
     ImGui::TextColored(ImVec4(1, 1, 1, 1), "CHEAT MENU");
     {
-        const float cs = 76.f * sc;
+        const float cs = 90.f * sc;
         ImGui::SetCursorPos(ImVec2(pw - cs - 26.f * sc, (hh - cs) * 0.5f));
         if (Btn("X", ImVec2(cs, cs), 20, IM_COL32(200, 60, 60, 255))) g_open = false;
     }
@@ -495,11 +509,13 @@ static void Draw(float W, float H, float dt) {
         if (Btn("+", ImVec2(sq, sq), 33, kBtn)) { g_btnScale = Clamp(g_btnScale + 0.10f, 0.70f, 1.50f); g_saveReq = true; }
         ImGui::Spacing();
         if (Btn("Fade button when idle", ImVec2(wide, btnH), 35, kBtn, true, g_fadeIdle ? "ON" : "OFF", g_fadeIdle)) { g_fadeIdle = !g_fadeIdle; g_saveReq = true; }
+        if (Btn("Lock button position", ImVec2(wide, btnH), 36, kBtn, true, g_lockPos ? "ON" : "OFF", g_lockPos)) { g_lockPos = !g_lockPos; g_saveReq = true; }
         if (Btn("Reset button position", ImVec2(wide, btnH), 34, kBtn)) { g_posInit = false; g_cfgFx = g_cfgFy = -1.f; g_saveReq = true; }
         ImGui::Spacing();
-        ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "ProMenu 0.2");
+        ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "ProMenu 0.3");
         ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "Game state: %d    Cheats found: %d/%d", g_dbgGameState, g_dbgCheatsFound, kCheatCount);
         ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "Touches: %d    Taps: %d", (int)g_dbgTouches, (int)g_dbgTaps);
+        ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "Raw events  up: %d  down: %d  move: %d", (int)g_dbgRaw[1], (int)g_dbgRaw[2], (int)g_dbgRaw[3]);
     }
     ImGui::EndChild();
 
