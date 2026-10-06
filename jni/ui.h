@@ -1,9 +1,8 @@
 #pragma once
-// Touch-first overlay: floating circle button + cheat panel.
+// ProMenu 0.4 - touch-first overlay: floating circle button + cheat panel.
 //
-// ImGui is used for DRAWING ONLY.  Tap, drag and scroll are handled right here from
-// the raw touch events, so nothing depends on ImGui's mouse click state machine
-// (which needs several frames per tap and is easily broken by finger jitter).
+// ImGui is used for DRAWING ONLY.  Tap, drag and scroll are handled here from the raw touch
+// events (1 = up, 2 = down, 3 = move), so nothing depends on ImGui's mouse click state machine.
 #include <float.h>
 #include <math.h>
 #include <pthread.h>
@@ -17,68 +16,146 @@
 
 namespace UI {
 
-// ---------------------------------------------------------------- cheats
-// Calls into the game's own CCheat functions (same code the typed cheats run).
-// Every symbol name below was checked against the original ARM CheatMenu binary.
-enum { kCall0 = 0, kCallInt = 1, kClock = 2, kGod = 3 };
-struct Cheat { int tab; const char* section; const char* label; const char* sym; int arg; int kind; void* fn; };
-
-static Cheat g_cheats[] = {
-#include "cheat_table.inc"
+// ======================================================================= data
+// The 100 cheats of the game, in the game's own index order (index into CCheat::m_aCheatFunctions
+// and CCheat::m_aCheatsActive).  Order and names were read from the original ARM menu.
+struct CheatDef { const char* name; const char* label; unsigned char group; };
+static const CheatDef kCheat[] = {
+#include "cheats100.inc"
 };
-static const int kCheatCount = (int)(sizeof(g_cheats) / sizeof(g_cheats[0]));
-static const char* kTabs[] = {"Player", "Vehicles", "Weapons", "World", "Fun", "Settings"};
-static const int kTabCount = 6;
-static const int kSettingsTab = 5;
+static const int kNumCheats = (int)(sizeof(kCheat) / sizeof(kCheat[0]));
+static const char* kGroupName[] = {
+#include "cheat_groups.inc"
+};
+static const int kNumGroups = (int)(sizeof(kGroupName) / sizeof(kGroupName[0]));
+static const int kDangerGroup = 10;
 
-static unsigned char* g_pCurrentDay = nullptr;   // CClock::CurrentDay
-static bool* g_pGodFlag = nullptr;               // CPlayerPed::bDebugPlayerInvincible
+struct Veh { const char* section; const char* label; int model; };
+static const Veh kVeh[] = {
+#include "vehicles.inc"
+};
+static const int kNumVeh = (int)(sizeof(kVeh) / sizeof(kVeh[0]));
 
-static int ResolveCheats(uintptr_t (*lookup)(const char*)) {
+enum { kTabPlayer = 0, kTabVehicle, kTabGame, kTabCheats, kTabMenu, kTabCount };
+static const char* kTabs[] = {"Player", "Vehicle", "Game", "Cheats", "Menu"};
+
+// ============================================================== game access
+typedef void (*CheatFn)();
+static CheatFn* g_cheatFns = nullptr;               // CCheat::m_aCheatFunctions  (nullptr entry = plain flag cheat)
+static unsigned char* g_cheatOn = nullptr;          // CCheat::m_aCheatsActive
+static bool g_cheatKnownToggle[128];                // learned: this cheat changed its flag when run
+static void (*g_vehicleCheat)(int) = nullptr;       // CCheat::VehicleCheat(model)
+static void (*g_setClock)(unsigned char, unsigned char, unsigned char) = nullptr;   // CClock::SetGameClock
+static void (*g_cheatWanted)(void*, int) = nullptr; // CPlayerPed::CheatWantedLevel(level)
+static void* (*g_findPlayerPed)(int) = nullptr;     // FindPlayerPed(0)
+static void* (*g_getPlayerInfo)(void*) = nullptr;   // CPlayerPed::GetPlayerInfoForThisPlayerPed()
+static unsigned char* g_pCurrentDay = nullptr;      // CClock::CurrentDay
+static bool* g_pGodFlag = nullptr;                  // CPlayerPed::bDebugPlayerInvincible
+static int g_godIdx = -1;                           // index of INVINCIBILITY in the cheat list
+
+// Field offsets inside the 64-bit game structures (read from the original menu's code)
+static const int kOffHealth = 0x6AC, kOffMaxHealth = 0x6B0, kOffArmour = 0x6B4;   // CPed
+static const int kOffMoney = 0xF0;                                                // CPlayerInfo
+
+template <typename T> static void Res(uintptr_t (*lookup)(const char*), T& out, const char* name, int& found) {
+    uintptr_t a = lookup(name);
+    out = reinterpret_cast<T>(a);
+    if (a) found++;
+}
+
+// returns how many of the 10 essential game symbols were found
+static int ResolveGame(uintptr_t (*lookup)(const char*)) {
     int found = 0;
-    for (int i = 0; i < kCheatCount; i++) {
-        uintptr_t a = lookup(g_cheats[i].sym);
-        g_cheats[i].fn = (void*)a;
-        if (a) found++;
-    }
-    g_pCurrentDay = (unsigned char*)lookup("_ZN6CClock10CurrentDayE");
-    g_pGodFlag = (bool*)lookup("_ZN10CPlayerPed22bDebugPlayerInvincibleE");
+    Res(lookup, g_cheatFns, "_ZN6CCheat17m_aCheatFunctionsE", found);
+    Res(lookup, g_cheatOn, "_ZN6CCheat15m_aCheatsActiveE", found);
+    Res(lookup, g_vehicleCheat, "_ZN6CCheat12VehicleCheatEi", found);
+    Res(lookup, g_setClock, "_ZN6CClock12SetGameClockEhhh", found);
+    Res(lookup, g_cheatWanted, "_ZN10CPlayerPed16CheatWantedLevelEi", found);
+    Res(lookup, g_findPlayerPed, "_Z13FindPlayerPedi", found);
+    Res(lookup, g_getPlayerInfo, "_ZN10CPlayerPed29GetPlayerInfoForThisPlayerPedEv", found);
+    Res(lookup, g_pCurrentDay, "_ZN6CClock10CurrentDayE", found);
+    Res(lookup, g_pGodFlag, "_ZN10CPlayerPed22bDebugPlayerInvincibleE", found);
+    for (int i = 0; i < kNumCheats; i++) if (!strcmp(kCheat[i].name, "INVINCIBILITY")) g_godIdx = i;
     return found;
 }
 
-// cheats are queued from the UI and executed inside the game's update tick
-static const int kQueueSize = 16;
-static int g_queue[kQueueSize];
+static bool CheatTablesOk() { return g_cheatFns != nullptr || g_cheatOn != nullptr; }
+
+// current state of cheat `idx` (what the game thinks is active)
+static bool StateOf(int idx) {
+    if (idx == g_godIdx && g_pGodFlag) return *g_pGodFlag;
+    return g_cheatOn ? g_cheatOn[idx] != 0 : false;
+}
+// does this cheat have an on/off state we can show?
+static bool IsToggle(int idx) {
+    if (idx == g_godIdx && g_pGodFlag) return true;
+    if (!g_cheatOn) return false;
+    if (g_cheatFns && g_cheatFns[idx] == nullptr) return true;     // plain flag cheat
+    return g_cheatKnownToggle[idx];
+}
+
+// same logic the original menu uses: call the game's cheat function, or flip the flag when there is none
+static void ExecCheat(int idx) {
+    const bool before = StateOf(idx);
+    CheatFn fn = g_cheatFns ? g_cheatFns[idx] : nullptr;
+    if (fn) fn();
+    else if (g_cheatOn) g_cheatOn[idx] = g_cheatOn[idx] ? 0 : 1;
+    if (StateOf(idx) != before) g_cheatKnownToggle[idx] = true;
+}
+
+static float Clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static char* PlayerPed() { return g_findPlayerPed ? (char*)g_findPlayerPed(0) : nullptr; }
+static char* PlayerInfo(char* ped) { return (ped && g_getPlayerInfo) ? (char*)g_getPlayerInfo(ped) : nullptr; }
+
+// ============================================================ action queue
+// The UI never touches the game directly; it queues actions that run inside the game's update tick.
+enum { aCheat = 0, aVehicle, aClock, aWanted, aHealth, aArmour, aMoney };
+struct Act { int kind; int i; float f; };
+static const int kQueueSize = 32;
+static Act g_queue[kQueueSize];
 static volatile int g_qHead = 0, g_qTail = 0;
 
-static void Enqueue(int cheatIndex) {
+static void Enqueue(int kind, int i, float f = 0.f) {
     int next = (g_qTail + 1) % kQueueSize;
     if (next == g_qHead) return;
-    g_queue[g_qTail] = cheatIndex;
+    g_queue[g_qTail].kind = kind; g_queue[g_qTail].i = i; g_queue[g_qTail].f = f;
     g_qTail = next;
 }
 
 static void RunQueued(bool gameIsRunning) {
     while (g_qHead != g_qTail) {
-        int i = g_queue[g_qHead];
+        const Act a = g_queue[g_qHead];
         g_qHead = (g_qHead + 1) % kQueueSize;
         if (!gameIsRunning) continue;
-        const Cheat& c = g_cheats[i];
-        if (!c.fn) continue;
-        switch (c.kind) {
-            case kCall0:
-            case kGod:     ((void (*)())c.fn)(); break;
-            case kCallInt: ((void (*)(int))c.fn)(c.arg); break;
-            case kClock: {
-                unsigned char day = g_pCurrentDay ? *g_pCurrentDay : 0;
-                ((void (*)(unsigned char, unsigned char, unsigned char))c.fn)((unsigned char)c.arg, 0, day);
+        switch (a.kind) {
+            case aCheat:   if (a.i >= 0 && a.i < kNumCheats) ExecCheat(a.i); break;
+            case aVehicle: if (g_vehicleCheat) g_vehicleCheat(a.i); break;
+            case aClock:   if (g_setClock) g_setClock((unsigned char)a.i, 0, g_pCurrentDay ? *g_pCurrentDay : 0); break;
+            case aWanted: {
+                char* ped = PlayerPed();
+                if (ped && g_cheatWanted) g_cheatWanted(ped, a.i);
+                break;
+            }
+            case aHealth: {
+                char* ped = PlayerPed();
+                if (ped) { float mx = *(float*)(ped + kOffMaxHealth); if (mx < 100.f) mx = 100.f; *(float*)(ped + kOffHealth) = Clamp(a.f, 1.f, mx); }
+                break;
+            }
+            case aArmour: {
+                char* ped = PlayerPed();
+                if (ped) *(float*)(ped + kOffArmour) = Clamp(a.f, 0.f, 100.f);
+                break;
+            }
+            case aMoney: {
+                char* info = PlayerInfo(PlayerPed());
+                if (info) *(int*)(info + kOffMoney) = (int)Clamp(a.f, 0.f, 99999999.f);
                 break;
             }
         }
     }
 }
 
-// ---------------------------------------------------------------- state
+// =============================================================== UI state
 static float g_sc = 1.f;                          // UI scale (screen height / 1080)
 static float g_slop = 48.f;                       // finger jitter allowed before a tap becomes a drag (pixels)
 static float g_scrW = 0.f, g_scrH = 0.f, g_fabD = 100.f;
@@ -90,12 +167,15 @@ static float g_openAnim = 0.f, g_idle = 0.f, g_fade = 1.f;
 static float g_btnAlpha = 0.92f, g_btnScale = 1.f;
 static bool g_fadeIdle = true;
 static bool g_lockPos = false;                    // when on, the floating button cannot be dragged
-static int g_tab = 0;
-static char g_toast[64] = "";
+static int g_tab = kTabCheats, g_lastTab = -1;
+static char g_toast[80] = "";
 static float g_toastT = 0.f;
+static bool g_expanded[64];                       // section expand/collapse state (cheat groups 0..11, vehicle sections 20..)
+static int g_armedIdx = -1;                       // danger cheat waiting for its second tap
+static float g_armedT = 0.f;
 
-// shown in Settings, filled in by main.cpp
-static int g_dbgGameState = -1, g_dbgCheatsFound = 0;
+// shown in Menu, filled in by main.cpp
+static int g_dbgGameState = -1, g_dbgFound = 0;
 static bool g_canRun = false;                     // game is in "playing" state
 static volatile int g_dbgTouches = 0, g_dbgTaps = 0;
 static volatile int g_dbgRaw[4] = {0, 0, 0, 0};   // raw event counts by type (1 = up, 2 = down, 3 = move)
@@ -124,7 +204,6 @@ static int g_tapQ[8];
 static volatile int g_tqH = 0, g_tqT = 0;
 
 static double Now() { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9; }
-static float Clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 static bool InRect(float x, float y, float x0, float y0, float x1, float y1) { return x >= x0 && x <= x1 && y >= y0 && y <= y1; }
 
 static int FindId(float x, float y) {
@@ -269,6 +348,142 @@ static void SaveConfig(float W, float H) {
     }
 }
 
+// ======================================================================= helpers
+static void Toast(const char* text) {
+    snprintf(g_toast, sizeof(g_toast), "%s", text);
+    g_toastT = text[0] ? 1.8f : 0.f;
+}
+
+// tap on cheat `idx`: danger cheats need a second tap, everything else runs at once
+static void OnCheatTap(int idx) {
+    if (!g_canRun) { Toast("Start playing first"); return; }
+    if (!CheatTablesOk()) { Toast("Cheat tables not found"); return; }
+    const CheatDef& c = kCheat[idx];
+    if (c.group == kDangerGroup && !(g_armedIdx == idx && g_armedT > 0.f)) {
+        g_armedIdx = idx; g_armedT = 2.5f;
+        Toast("Tap again to confirm");
+        return;
+    }
+    g_armedIdx = -1; g_armedT = 0.f;
+    const bool wasOn = StateOf(idx);
+    Enqueue(aCheat, idx);
+    char msg[80];
+    snprintf(msg, sizeof(msg), "Cheat %s %s", c.name, wasOn ? "Deactivated" : "Activated");   // same wording as the original
+    Toast(msg);
+}
+
+static int g_fired[8];
+static int g_nFired = 0;
+static bool Fired(int id) { for (int i = 0; i < g_nFired; i++) if (g_fired[i] == id) return true; return false; }
+
+static void Reg(ImVec2 p, ImVec2 q, int id) {
+    const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
+    TapRect r = { fmaxf(p.x, wp.x), fmaxf(p.y, wp.y), fminf(q.x, wp.x + ws.x), fminf(q.y, wp.y + ws.y), id };
+    if (r.x1 > r.x0 && r.y1 > r.y0) g_rectsBuild.push_back(r);
+}
+static bool Pressed(int id) { return g_finger >= 0 && !g_moved && g_downId == id; }
+
+// A button drawn by hand.  It is "tapped" when the raw touch logic reports its id.
+static bool Btn(const char* label, ImVec2 size, int id, ImU32 fill, bool enabled = true,
+                const char* tag = nullptr, bool tagOn = false) {
+    const float sc = g_sc;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(size);
+    const ImVec2 q(p.x + size.x, p.y + size.y);
+    if (enabled && id) Reg(p, q, id);
+
+    ImU32 col = (enabled && Pressed(id)) ? IM_COL32(52, 120, 246, 255) : fill;
+    if (!enabled) col = IM_COL32(30, 34, 46, 255);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, q, col, 18.f * sc);
+
+    const ImU32 tc = enabled ? IM_COL32(255, 255, 255, 255) : IM_COL32(120, 125, 140, 255);
+    const float fs = ImGui::GetFontSize();
+    const ImVec2 ts = ImGui::CalcTextSize(label);
+    const float maxW = size.x - 36.f * sc - (tag ? 96.f * sc : 0.f);
+    float k = 1.f;
+    if (ts.x > maxW && ts.x > 0.f) k = maxW / ts.x;
+    const float tw = ts.x * k, th = ts.y * k;
+    const float tx = tag ? p.x + 22.f * sc : p.x + (size.x - tw) * 0.5f;
+    dl->AddText(ImGui::GetFont(), fs * k, ImVec2(tx, p.y + (size.y - th) * 0.5f), tc, label);
+
+    if (tag) {
+        const ImVec2 gs = ImGui::CalcTextSize(tag);
+        const float pw = gs.x + 26.f * sc, ph = 42.f * sc;
+        const ImVec2 a(q.x - pw - 16.f * sc, p.y + (size.y - ph) * 0.5f);
+        dl->AddRectFilled(a, ImVec2(a.x + pw, a.y + ph), tagOn ? IM_COL32(36, 170, 90, 255) : IM_COL32(70, 75, 92, 255), ph * 0.5f);
+        dl->AddText(ImVec2(a.x + 13.f * sc, a.y + (ph - gs.y) * 0.5f), IM_COL32(255, 255, 255, 255), tag);
+    }
+    return enabled && Fired(id);
+}
+
+// collapsible section bar; returns true when tapped
+static bool Header(const char* label, int count, int id, bool expanded) {
+    const float sc = g_sc;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ScrollbarSize - 4.f * sc;
+    const float h = 68.f * sc;
+    ImGui::Dummy(ImVec2(w, h));
+    const ImVec2 q(p.x + w, p.y + h);
+    Reg(p, q, id);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(p, q, Pressed(id) ? IM_COL32(35, 60, 110, 255) : IM_COL32(26, 34, 54, 255), 16.f * sc);
+    const float cx = p.x + 36.f * sc, cy = p.y + h * 0.5f, r = 11.f * sc;
+    const ImU32 ac = IM_COL32(111, 160, 255, 255);
+    if (expanded) dl->AddTriangleFilled(ImVec2(cx - r, cy - r * 0.6f), ImVec2(cx + r, cy - r * 0.6f), ImVec2(cx, cy + r * 0.8f), ac);
+    else          dl->AddTriangleFilled(ImVec2(cx - r * 0.6f, cy - r), ImVec2(cx - r * 0.6f, cy + r), ImVec2(cx + r * 0.8f, cy), ac);
+    const ImVec2 ts = ImGui::CalcTextSize(label);
+    dl->AddText(ImVec2(p.x + 70.f * sc, p.y + (h - ts.y) * 0.5f), IM_COL32(255, 255, 255, 255), label);
+    if (count > 0) {
+        char n[16]; snprintf(n, sizeof(n), "%d", count);
+        const ImVec2 ns = ImGui::CalcTextSize(n);
+        dl->AddText(ImVec2(q.x - ns.x - 24.f * sc, p.y + (h - ns.y) * 0.5f), IM_COL32(140, 150, 175, 255), n);
+    }
+    return Fired(id);
+}
+
+static float RowWidth() { return ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ScrollbarSize - 4.f * g_sc; }
+
+// value editor:  [--] [-] [ value ] [+] [++]  and a row of preset buttons.
+// returns: -2 / -1 / +1 / +2 for the step buttons, 10 + k for preset k, 0 for nothing
+static int Stepper(const char* title, int idBase, const char* value, const char* small, const char* big,
+                   const char* const* presets, int nPresets, bool enabled) {
+    const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
+    const ImU32 kBtn = IM_COL32(40, 48, 68, 255);
+    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "%s", title);
+    const float avail = RowWidth();
+    const float bw = 120.f * sc, bh = 92.f * sc, vw = avail - 4.f * bw - 4.f * sp;
+    char b1[24], b2[24], b3[24], b4[24];
+    snprintf(b1, sizeof(b1), "-%s", big);   snprintf(b2, sizeof(b2), "-%s", small);
+    snprintf(b3, sizeof(b3), "+%s", small); snprintf(b4, sizeof(b4), "+%s", big);
+    int r = 0;
+    if (Btn(b1, ImVec2(bw, bh), idBase + 0, kBtn, enabled)) r = -2;
+    ImGui::SameLine();
+    if (Btn(b2, ImVec2(bw, bh), idBase + 1, kBtn, enabled)) r = -1;
+    ImGui::SameLine();
+    {
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(vw, bh));
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p, ImVec2(p.x + vw, p.y + bh), IM_COL32(16, 20, 30, 255), 18.f * sc);
+        const ImVec2 ts = ImGui::CalcTextSize(value);
+        dl->AddText(ImVec2(p.x + (vw - ts.x) * 0.5f, p.y + (bh - ts.y) * 0.5f), IM_COL32(255, 255, 255, 255), value);
+    }
+    ImGui::SameLine();
+    if (Btn(b3, ImVec2(bw, bh), idBase + 2, kBtn, enabled)) r = 1;
+    ImGui::SameLine();
+    if (Btn(b4, ImVec2(bw, bh), idBase + 3, kBtn, enabled)) r = 2;
+    if (nPresets > 0) {
+        const float pw = (avail - sp * (float)(nPresets - 1)) / (float)nPresets;
+        for (int k = 0; k < nPresets; k++) {
+            if (k) ImGui::SameLine();
+            if (Btn(presets[k], ImVec2(pw, 80.f * sc), idBase + 10 + k, kBtn, enabled)) r = 10 + k;
+        }
+    }
+    ImGui::Spacing();
+    return r;
+}
+
 static void Init(float scale) {
     g_sc = scale;
     g_slop = fmaxf(40.f, 48.f * scale);
@@ -284,70 +499,159 @@ static void Init(float scale) {
     st.Colors[ImGuiCol_ChildBg]       = ImVec4(0, 0, 0, 0);
     st.Colors[ImGuiCol_ScrollbarBg]   = ImVec4(0, 0, 0, 0);
     st.Colors[ImGuiCol_ScrollbarGrab] = ImVec4(1, 1, 1, 0.22f);
+    g_expanded[0] = true;        // first cheat group
+    g_expanded[20] = true;       // first vehicle section
 }
 
-// ---------------------------------------------------------------- widgets
-static int g_fired[8];
-static int g_nFired = 0;
-static bool Fired(int id) { for (int i = 0; i < g_nFired; i++) if (g_fired[i] == id) return true; return false; }
+// ========================================================================= pages
+static const ImU32 kBtnCol = IM_COL32(40, 48, 68, 255);
+static const ImU32 kDangerCol = IM_COL32(86, 44, 52, 255);
 
-static void Toast(const char* text) {
-    snprintf(g_toast, sizeof(g_toast), "%s", text);
-    g_toastT = text[0] ? 1.6f : 0.f;
-}
+static void PagePlayer() {
+    const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
+    char* ped = g_canRun ? PlayerPed() : nullptr;
+    char* info = PlayerInfo(ped);
+    const bool ok = ped != nullptr;
 
-// A button drawn by hand.  It is "tapped" when the raw touch logic above reports its id.
-static bool Btn(const char* label, ImVec2 size, int id, ImU32 fill, bool enabled = true,
-                const char* tag = nullptr, bool tagOn = false) {
-    const float sc = g_sc;
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(size);
-    const ImVec2 q(p.x + size.x, p.y + size.y);
-
-    if (enabled && id) {
-        const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
-        TapRect r = { fmaxf(p.x, wp.x), fmaxf(p.y, wp.y), fminf(q.x, wp.x + ws.x), fminf(q.y, wp.y + ws.y), id };
-        if (r.x1 > r.x0 && r.y1 > r.y0) g_rectsBuild.push_back(r);
+    // wanted level 0..6
+    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "Wanted level");
+    {
+        const float w = (RowWidth() - sp * 6.f) / 7.f;
+        for (int lv = 0; lv <= 6; lv++) {
+            if (lv) ImGui::SameLine();
+            char t[4]; snprintf(t, sizeof(t), "%d", lv);
+            if (Btn(t, ImVec2(w, 92.f * sc), 380 + lv, kBtnCol, ok && g_cheatWanted != nullptr)) { Enqueue(aWanted, lv); Toast("Wanted level set"); }
+        }
     }
-
-    const bool pressed = enabled && g_finger >= 0 && !g_moved && g_downId == id;
-    ImU32 col = pressed ? IM_COL32(52, 120, 246, 255) : fill;
-    if (!enabled) col = IM_COL32(30, 34, 46, 255);
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(p, q, col, 18.f * sc);
-
-    const ImU32 tc = enabled ? IM_COL32(255, 255, 255, 255) : IM_COL32(120, 125, 140, 255);
-    const float fs = ImGui::GetFontSize();
-    const ImVec2 ts = ImGui::CalcTextSize(label);
-    const float maxW = size.x - 36.f * sc - (tag ? 100.f * sc : 0.f);
-    float k = 1.f;
-    if (ts.x > maxW && ts.x > 0.f) k = maxW / ts.x;
-    const float tw = ts.x * k, th = ts.y * k;
-    const float tx = tag ? p.x + 22.f * sc : p.x + (size.x - tw) * 0.5f;
-    dl->AddText(ImGui::GetFont(), fs * k, ImVec2(tx, p.y + (size.y - th) * 0.5f), tc, label);
-
-    if (tag) {
-        const ImVec2 gs = ImGui::CalcTextSize(tag);
-        const float pw = gs.x + 28.f * sc, ph = 42.f * sc;
-        const ImVec2 a(q.x - pw - 18.f * sc, p.y + (size.y - ph) * 0.5f);
-        dl->AddRectFilled(a, ImVec2(a.x + pw, a.y + ph), tagOn ? IM_COL32(36, 170, 90, 255) : IM_COL32(70, 75, 92, 255), ph * 0.5f);
-        dl->AddText(ImVec2(a.x + 14.f * sc, a.y + (ph - gs.y) * 0.5f), IM_COL32(255, 255, 255, 255), tag);
-    }
-    return enabled && Fired(id);
-}
-
-static void Section(const char* text) {
     ImGui::Spacing();
-    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "%s", text);
+
+    float hp = 0.f, mx = 100.f, ar = 0.f; int money = 0;
+    if (ped) { hp = *(float*)(ped + kOffHealth); mx = *(float*)(ped + kOffMaxHealth); ar = *(float*)(ped + kOffArmour); }
+    if (info) money = *(int*)(info + kOffMoney);
+    if (mx < 100.f) mx = 100.f;
+    char v[48];
+
+    static const char* const kHp[] = {"Min", "Default", "Max"};
+    snprintf(v, sizeof(v), ok ? "%d / %d" : "-", (int)(hp + 0.5f), (int)(mx + 0.5f));
+    int r = Stepper("Health", 400, v, "1", "10", kHp, 3, ok);
+    if (r == -2) Enqueue(aHealth, 0, hp - 10.f); else if (r == -1) Enqueue(aHealth, 0, hp - 1.f);
+    else if (r == 1) Enqueue(aHealth, 0, hp + 1.f); else if (r == 2) Enqueue(aHealth, 0, hp + 10.f);
+    else if (r == 10) Enqueue(aHealth, 0, 1.f); else if (r == 11) Enqueue(aHealth, 0, 100.f); else if (r == 12) Enqueue(aHealth, 0, mx);
+
+    snprintf(v, sizeof(v), ok ? "%d / 100" : "-", (int)(ar + 0.5f));
+    r = Stepper("Armour", 430, v, "1", "10", kHp, 3, ok);
+    if (r == -2) Enqueue(aArmour, 0, ar - 10.f); else if (r == -1) Enqueue(aArmour, 0, ar - 1.f);
+    else if (r == 1) Enqueue(aArmour, 0, ar + 1.f); else if (r == 2) Enqueue(aArmour, 0, ar + 10.f);
+    else if (r == 10) Enqueue(aArmour, 0, 0.f); else if (r == 11) Enqueue(aArmour, 0, 0.f); else if (r == 12) Enqueue(aArmour, 0, 100.f);
+
+    static const char* const kMoney[] = {"$0", "$10k", "$1M", "Max"};
+    snprintf(v, sizeof(v), info ? "$%d" : "-", money);
+    r = Stepper("Money", 460, v, "1k", "100k", kMoney, 4, info != nullptr);
+    const float m = (float)money;
+    if (r == -2) Enqueue(aMoney, 0, m - 100000.f); else if (r == -1) Enqueue(aMoney, 0, m - 1000.f);
+    else if (r == 1) Enqueue(aMoney, 0, m + 1000.f); else if (r == 2) Enqueue(aMoney, 0, m + 100000.f);
+    else if (r == 10) Enqueue(aMoney, 0, 0.f); else if (r == 11) Enqueue(aMoney, 0, 10000.f);
+    else if (r == 12) Enqueue(aMoney, 0, 1000000.f); else if (r == 13) Enqueue(aMoney, 0, 99999999.f);
+
+    if (!ok) ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "Start playing to edit these values");
+    ImGui::Dummy(ImVec2(1.f, 90.f * sc));
 }
 
-static void OnCheatPressed(int i) {
-    if (!g_canRun) { Toast("Start playing first"); return; }
-    Enqueue(i);
-    Toast(g_cheats[i].label);
+static void PageVehicle() {
+    const float sc = g_sc;
+    const float sp = ImGui::GetStyle().ItemSpacing.x;
+    const float colW = (RowWidth() - sp * 2.f) / 3.f;
+    const char* lastSec = nullptr;
+    int secIdx = -1, n = 0;
+    bool open = true;
+    for (int i = 0; i < kNumVeh; i++) {
+        const Veh& v = kVeh[i];
+        if (!lastSec || strcmp(v.section, lastSec) != 0) {
+            lastSec = v.section; secIdx++; n = 0;
+            int count = 0; for (int j = i; j < kNumVeh && !strcmp(kVeh[j].section, v.section); j++) count++;
+            open = g_expanded[20 + secIdx];
+            if (Header(v.section, count, 320 + secIdx, open)) g_expanded[20 + secIdx] = !g_expanded[20 + secIdx];
+        }
+        if (!open) continue;
+        if (n % 3) ImGui::SameLine();
+        if (Btn(v.label, ImVec2(colW, 96.f * sc), 2000 + i, kBtnCol, g_vehicleCheat != nullptr)) {
+            if (!g_canRun) Toast("Start playing first");
+            else { Enqueue(aVehicle, v.model); Toast(v.label); }
+        }
+        n++;
+    }
+    ImGui::Dummy(ImVec2(1.f, 90.f * sc));
 }
 
-// ------------------------------------------------------------------- draw
+static void PageGame() {
+    const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
+    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "Set game time");
+    const float w = (RowWidth() - sp * 3.f) / 4.f;
+    static const char* const kT[] = {"00:00", "06:00", "12:00", "18:00"};
+    for (int k = 0; k < 4; k++) {
+        if (k) ImGui::SameLine();
+        if (Btn(kT[k], ImVec2(w, 96.f * sc), 340 + k, kBtnCol, g_setClock != nullptr)) {
+            if (!g_canRun) Toast("Start playing first"); else { Enqueue(aClock, k * 6); Toast(kT[k]); }
+        }
+    }
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "Weather and time cheats are in the Cheats tab.");
+}
+
+static void PageCheats() {
+    const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
+    if (!CheatTablesOk()) {
+        ImGui::TextColored(ImVec4(1.f, 0.55f, 0.45f, 1), "Cheat tables not found in this game version.");
+        return;
+    }
+    const float colW = (RowWidth() - sp) * 0.5f;
+    for (int g = 0; g < kNumGroups; g++) {
+        int count = 0;
+        for (int i = 0; i < kNumCheats; i++) if (kCheat[i].group == g) count++;
+        if (Header(kGroupName[g], count, 300 + g, g_expanded[g])) g_expanded[g] = !g_expanded[g];
+        if (!g_expanded[g]) continue;
+        int n = 0;
+        for (int i = 0; i < kNumCheats; i++) {
+            if (kCheat[i].group != g) continue;
+            if (n % 2) ImGui::SameLine();
+            const bool armed = (g_armedIdx == i && g_armedT > 0.f);
+            const char* tag = nullptr; bool on = false;
+            if (!armed && IsToggle(i)) { on = StateOf(i); tag = on ? "ON" : "OFF"; }
+            const ImU32 fill = armed ? IM_COL32(190, 70, 40, 255) : (g == kDangerGroup ? kDangerCol : kBtnCol);
+            if (Btn(armed ? "TAP AGAIN" : kCheat[i].label, ImVec2(colW, 96.f * sc), 1000 + i, fill, true, tag, on)) OnCheatTap(i);
+            n++;
+        }
+    }
+    ImGui::Dummy(ImVec2(1.f, 90.f * sc));
+}
+
+static void PageMenu() {
+    const float sc = g_sc;
+    const float sq = 88.f * sc, wide = RowWidth(), btnH = 96.f * sc;
+    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "Floating button");
+    ImGui::Text("Opacity: %d%%", (int)(g_btnAlpha * 100.f + 0.5f));
+    if (Btn("-", ImVec2(sq, sq), 30, kBtnCol)) { g_btnAlpha = Clamp(g_btnAlpha - 0.10f, 0.15f, 1.f); g_saveReq = true; }
+    ImGui::SameLine();
+    if (Btn("+", ImVec2(sq, sq), 31, kBtnCol)) { g_btnAlpha = Clamp(g_btnAlpha + 0.10f, 0.15f, 1.f); g_saveReq = true; }
+    ImGui::Text("Size: %d%%", (int)(g_btnScale * 100.f + 0.5f));
+    if (Btn("-", ImVec2(sq, sq), 32, kBtnCol)) { g_btnScale = Clamp(g_btnScale - 0.10f, 0.70f, 1.50f); g_saveReq = true; }
+    ImGui::SameLine();
+    if (Btn("+", ImVec2(sq, sq), 33, kBtnCol)) { g_btnScale = Clamp(g_btnScale + 0.10f, 0.70f, 1.50f); g_saveReq = true; }
+    if (Btn("Fade when idle", ImVec2(wide, btnH), 35, kBtnCol, true, g_fadeIdle ? "ON" : "OFF", g_fadeIdle)) { g_fadeIdle = !g_fadeIdle; g_saveReq = true; }
+    if (Btn("Lock position", ImVec2(wide, btnH), 36, kBtnCol, true, g_lockPos ? "ON" : "OFF", g_lockPos)) { g_lockPos = !g_lockPos; g_saveReq = true; }
+    if (Btn("Reset position", ImVec2(wide, btnH), 34, kBtnCol)) { g_posInit = false; g_cfgFx = g_cfgFy = -1.f; g_saveReq = true; }
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "About");
+    const ImVec4 dim(0.55f, 0.60f, 0.70f, 1);
+    ImGui::TextColored(dim, "ProMenu 0.4");
+    ImGui::TextColored(dim, "Game state: %d    Game symbols: %d/9", g_dbgGameState, g_dbgFound);
+    ImGui::TextColored(dim, "Cheat tables: %s", CheatTablesOk() ? "found" : "missing");
+    ImGui::TextColored(dim, "Touches: %d    Taps: %d", (int)g_dbgTouches, (int)g_dbgTaps);
+    ImGui::TextColored(dim, "Raw events  up: %d  down: %d  move: %d", (int)g_dbgRaw[1], (int)g_dbgRaw[2], (int)g_dbgRaw[3]);
+    ImGui::Dummy(ImVec2(1.f, 60.f * sc));
+}
+
+// ======================================================================= draw
 static void Draw(float W, float H, float dt) {
     const float sc = g_sc;
     g_scrW = W; g_scrH = H;
@@ -371,6 +675,7 @@ static void Draw(float W, float H, float dt) {
     pthread_mutex_unlock(&g_lock);
     g_rectsBuild.clear();
     g_dbgTaps = g_dbgTaps + g_nFired;
+    if (g_armedT > 0.f) { g_armedT -= dt; if (g_armedT <= 0.f) g_armedIdx = -1; }
 
     if (g_finger >= 0 && Now() - g_lastEventT > 5.0) ResetFinger();      // lost UP event: never stay stuck
     if (g_fabTap) { g_fabTap = false; g_open = !g_open; Toast(""); }
@@ -442,8 +747,7 @@ static void Draw(float W, float H, float dt) {
     ImGui::Begin("##panel", nullptr, panelFlags);
 
     const float hh = 84.f * sc;                      // header height
-    const float btnH = 104.f * sc;                   // standard button height
-    const ImU32 kBtn = IM_COL32(40, 48, 68, 255);
+    const float btnH = 96.f * sc;                    // sidebar button height
     const ImU32 kAccent = IM_COL32(52, 120, 246, 255);
 
     ImGui::SetCursorPos(ImVec2(18.f * sc, (hh - ImGui::GetFontSize()) * 0.5f));
@@ -461,7 +765,7 @@ static void Draw(float W, float H, float dt) {
     // sidebar
     ImGui::BeginChild("##side", ImVec2(sideW, bodyH), 0, ImGuiWindowFlags_NoScrollbar);
     for (int t = 0; t < kTabCount; t++)
-        if (Btn(kTabs[t], ImVec2(ImGui::GetContentRegionAvail().x, btnH), 1 + t, g_tab == t ? kAccent : kBtn)) g_tab = t;
+        if (Btn(kTabs[t], ImVec2(ImGui::GetContentRegionAvail().x, btnH), 1 + t, g_tab == t ? kAccent : kBtnCol)) g_tab = t;
     ImGui::EndChild();
 
     ImGui::SameLine();
@@ -471,51 +775,18 @@ static void Draw(float W, float H, float dt) {
     {
         const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
         g_cX0 = wp.x; g_cY0 = wp.y; g_cX1 = wp.x + ws.x; g_cY1 = wp.y + ws.y;
-        if (scrollDy != 0.f) { ImGui::SetScrollY(ImGui::GetScrollY() - scrollDy); g_fling = 0.f; }
+        if (g_tab != g_lastTab) { ImGui::SetScrollY(0.f); g_lastTab = g_tab; g_fling = 0.f; }
+        else if (scrollDy != 0.f) { ImGui::SetScrollY(ImGui::GetScrollY() - scrollDy); g_fling = 0.f; }
         else if (g_finger >= 0 && g_scrollArea) g_fling = 0.f;
         else if (fabsf(g_fling) > 40.f) { ImGui::SetScrollY(ImGui::GetScrollY() - g_fling * dt); g_fling = g_fling * expf(-dt * 3.5f); }
         else g_fling = 0.f;
     }
-
-    if (g_tab != kSettingsTab) {
-        const int cols = (g_tab == 1) ? 3 : 2;
-        const float spacing = ImGui::GetStyle().ItemSpacing.x;
-        const float availW = ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ScrollbarSize - 4.f * sc;
-        const float colW = (availW - spacing * (float)(cols - 1)) / (float)cols;
-        const char* lastSec = nullptr;
-        int n = 0;
-        for (int i = 0; i < kCheatCount; i++) {
-            Cheat& c = g_cheats[i];
-            if (c.tab != g_tab) continue;
-            if (c.section && (!lastSec || strcmp(c.section, lastSec) != 0)) { Section(c.section); lastSec = c.section; n = 0; }
-            if (n % cols) ImGui::SameLine();
-            const char* tag = nullptr; bool tagOn = false;
-            if (c.kind == kGod && g_pGodFlag) { tagOn = *g_pGodFlag; tag = tagOn ? "ON" : "OFF"; }
-            if (Btn(c.label, ImVec2(colW, btnH), 100 + i, kBtn, c.fn != nullptr, tag, tagOn)) OnCheatPressed(i);
-            n++;
-        }
-        ImGui::Dummy(ImVec2(1.f, 90.f * sc));       // room for the toast
-    } else {
-        const float sq = 88.f * sc;
-        const float wide = ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ScrollbarSize - 4.f * sc;
-        ImGui::Text("Button opacity: %d%%", (int)(g_btnAlpha * 100.f + 0.5f));
-        if (Btn("-", ImVec2(sq, sq), 30, kBtn)) { g_btnAlpha = Clamp(g_btnAlpha - 0.10f, 0.15f, 1.f); g_saveReq = true; }
-        ImGui::SameLine();
-        if (Btn("+", ImVec2(sq, sq), 31, kBtn)) { g_btnAlpha = Clamp(g_btnAlpha + 0.10f, 0.15f, 1.f); g_saveReq = true; }
-        ImGui::Spacing();
-        ImGui::Text("Button size: %d%%", (int)(g_btnScale * 100.f + 0.5f));
-        if (Btn("-", ImVec2(sq, sq), 32, kBtn)) { g_btnScale = Clamp(g_btnScale - 0.10f, 0.70f, 1.50f); g_saveReq = true; }
-        ImGui::SameLine();
-        if (Btn("+", ImVec2(sq, sq), 33, kBtn)) { g_btnScale = Clamp(g_btnScale + 0.10f, 0.70f, 1.50f); g_saveReq = true; }
-        ImGui::Spacing();
-        if (Btn("Fade button when idle", ImVec2(wide, btnH), 35, kBtn, true, g_fadeIdle ? "ON" : "OFF", g_fadeIdle)) { g_fadeIdle = !g_fadeIdle; g_saveReq = true; }
-        if (Btn("Lock button position", ImVec2(wide, btnH), 36, kBtn, true, g_lockPos ? "ON" : "OFF", g_lockPos)) { g_lockPos = !g_lockPos; g_saveReq = true; }
-        if (Btn("Reset button position", ImVec2(wide, btnH), 34, kBtn)) { g_posInit = false; g_cfgFx = g_cfgFy = -1.f; g_saveReq = true; }
-        ImGui::Spacing();
-        ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "ProMenu 0.3");
-        ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "Game state: %d    Cheats found: %d/%d", g_dbgGameState, g_dbgCheatsFound, kCheatCount);
-        ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "Touches: %d    Taps: %d", (int)g_dbgTouches, (int)g_dbgTaps);
-        ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "Raw events  up: %d  down: %d  move: %d", (int)g_dbgRaw[1], (int)g_dbgRaw[2], (int)g_dbgRaw[3]);
+    switch (g_tab) {
+        case kTabPlayer:  PagePlayer();  break;
+        case kTabVehicle: PageVehicle(); break;
+        case kTabGame:    PageGame();    break;
+        case kTabCheats:  PageCheats();  break;
+        default:          PageMenu();    break;
     }
     ImGui::EndChild();
 

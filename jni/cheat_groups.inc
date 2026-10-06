@@ -1,0 +1,12 @@
+    "Player & health",
+    "Body & skills",
+    "Wanted level",
+    "Weapons & gear",
+    "Spawn vehicles",
+    "Vehicle effects",
+    "Traffic & drivers",
+    "Weather",
+    "Time",
+    "Peds & fun",
+    "Danger (tap twice)",
+    "Debug / system"
