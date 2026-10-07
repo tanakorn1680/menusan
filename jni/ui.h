@@ -24,10 +24,18 @@ static const CheatDef kCheat[] = {
 #include "cheats100.inc"
 };
 static const int kNumCheats = (int)(sizeof(kCheat) / sizeof(kCheat[0]));
+static const char* kCheatTh[] = {
+#include "cheats100_th.inc"
+};
+static_assert(sizeof(kCheatTh) / sizeof(kCheatTh[0]) == sizeof(kCheat) / sizeof(kCheat[0]), "Thai cheat labels must match the cheat list");
 static const char* kGroupName[] = {
 #include "cheat_groups.inc"
 };
 static const int kNumGroups = (int)(sizeof(kGroupName) / sizeof(kGroupName[0]));
+static const char* kGroupNameTh[] = {
+#include "cheat_groups_th.inc"
+};
+static_assert(sizeof(kGroupNameTh) / sizeof(kGroupNameTh[0]) == sizeof(kGroupName) / sizeof(kGroupName[0]), "Thai group names must match");
 static const int kDangerGroup = 10;
 
 struct Veh { const char* section; const char* label; int model; };
@@ -167,6 +175,8 @@ static float g_openAnim = 0.f, g_idle = 0.f, g_fade = 1.f;
 static float g_btnAlpha = 0.92f, g_btnScale = 1.f;
 static bool g_fadeIdle = true;
 static bool g_lockPos = false;                    // when on, the floating button cannot be dragged
+static int g_lang = 0;                            // 0 = English, 1 = Thai
+static bool g_thaiOk = false;                     // a Thai font was loaded (set by main.cpp)
 static int g_tab = kTabCheats, g_lastTab = -1;
 static char g_toast[80] = "";
 static float g_toastT = 0.f;
@@ -323,12 +333,13 @@ static void LoadConfig() {
         snprintf(path, sizeof(path), "%s/config.txt", kCfgDirs[i]);
         FILE* f = fopen(path, "r");
         if (!f) continue;
-        float fx, fy, a, s; int fade, lock = 0;
-        if (fscanf(f, "%f %f %f %f %d %d", &fx, &fy, &a, &s, &fade, &lock) >= 5) {
+        float fx, fy, a, s; int fade, lock = 0, lang = 0;
+        if (fscanf(f, "%f %f %f %f %d %d %d", &fx, &fy, &a, &s, &fade, &lock, &lang) >= 5) {
             g_cfgFx = Clamp(fx, 0.f, 1.f); g_cfgFy = Clamp(fy, 0.f, 1.f);
             g_btnAlpha = Clamp(a, 0.15f, 1.f); g_btnScale = Clamp(s, 0.7f, 1.5f);
             g_fadeIdle = fade != 0;
             g_lockPos = lock != 0;
+            g_lang = (lang == 1 && g_thaiOk) ? 1 : 0;
         }
         fclose(f);
         return;
@@ -342,13 +353,48 @@ static void SaveConfig(float W, float H) {
         snprintf(path, sizeof(path), "%s/config.txt", kCfgDirs[i]);
         FILE* f = fopen(path, "w");
         if (!f) continue;
-        fprintf(f, "%.5f %.5f %.3f %.3f %d %d\n", g_fabX / W, g_fabY / H, g_btnAlpha, g_btnScale, g_fadeIdle ? 1 : 0, g_lockPos ? 1 : 0);
+        fprintf(f, "%.5f %.5f %.3f %.3f %d %d %d\n", g_fabX / W, g_fabY / H, g_btnAlpha, g_btnScale, g_fadeIdle ? 1 : 0, g_lockPos ? 1 : 0, g_lang);
         fclose(f);
         return;
     }
 }
 
 // ======================================================================= helpers
+// ================================================================ language
+struct TrPair { const char* en; const char* th; };
+static const TrPair kTr[] = {
+    {"Player", "ผู้เล่น"}, {"Vehicle", "ยานพาหนะ"}, {"Game", "เกม"}, {"Cheats", "สูตรโกง"}, {"Menu", "เมนู"},
+    {"CHEAT MENU", "เมนูสูตรโกง"},
+    {"ON", "เปิด"}, {"OFF", "ปิด"}, {"TAP AGAIN", "แตะอีกครั้ง"},
+    {"Start playing first", "เข้าเกมก่อน"}, {"Cheat tables not found", "ไม่พบตารางสูตร"},
+    {"Tap again to confirm", "แตะอีกครั้งเพื่อยืนยัน"},
+    {"Wanted level", "ระดับตำรวจ"}, {"Wanted level set", "ตั้งระดับตำรวจแล้ว"},
+    {"Health", "เลือด"}, {"Armour", "เกราะ"}, {"Money", "เงิน"},
+    {"Min", "ต่ำสุด"}, {"Default", "ค่าเริ่มต้น"}, {"Max", "สูงสุด"},
+    {"Start playing to edit these values", "เข้าเกมก่อนจึงแก้ค่าเหล่านี้ได้"},
+    {"Cars", "รถยนต์"}, {"Bikes", "มอเตอร์ไซค์"}, {"Trucks, off-road & special", "รถบรรทุก ออฟโรด และพิเศษ"},
+    {"Air", "อากาศยาน"}, {"Sea", "เรือ"},
+    {"Set game time", "ตั้งเวลาในเกม"},
+    {"Weather and time cheats are in the Cheats tab.", "สูตรอากาศและเวลาอยู่ในแท็บสูตรโกง"},
+    {"Cheat tables not found in this game version.", "ไม่พบตารางสูตรในเกมเวอร์ชันนี้"},
+    {"Floating button", "ปุ่มลอย"},
+    {"Opacity: %d%%", "ความโปร่งใส: %d%%"}, {"Size: %d%%", "ขนาด: %d%%"},
+    {"Fade when idle", "จางเมื่อไม่แตะ"}, {"Lock position", "ล็อกตำแหน่ง"}, {"Reset position", "รีเซ็ตตำแหน่ง"},
+    {"Language", "ภาษา"}, {"About", "เกี่ยวกับ"},
+    {"Game state: %d    Game symbols: %d/9", "สถานะเกม: %d    สัญลักษณ์เกม: %d/9"},
+    {"Cheat tables: %s", "ตารางสูตร: %s"}, {"found", "พบ"}, {"missing", "ไม่พบ"},
+    {"Touches: %d    Taps: %d", "สัมผัส: %d    แตะ: %d"},
+    {"Raw events  up: %d  down: %d  move: %d", "เหตุการณ์ดิบ  ยก: %d  กด: %d  เลื่อน: %d"},
+};
+// text in the current language; unknown strings fall back to English
+static const char* Tr(const char* en) {
+    if (g_lang != 1) return en;
+    for (size_t i = 0; i < sizeof(kTr) / sizeof(kTr[0]); i++) if (!strcmp(kTr[i].en, en)) return kTr[i].th;
+    return en;
+}
+static const char* CheatLabel(int i) { return g_lang == 1 ? kCheatTh[i] : kCheat[i].label; }
+static const char* GroupLabel(int g) { return g_lang == 1 ? kGroupNameTh[g] : kGroupName[g]; }
+
 static void Toast(const char* text) {
     snprintf(g_toast, sizeof(g_toast), "%s", text);
     g_toastT = text[0] ? 1.8f : 0.f;
@@ -356,19 +402,20 @@ static void Toast(const char* text) {
 
 // tap on cheat `idx`: danger cheats need a second tap, everything else runs at once
 static void OnCheatTap(int idx) {
-    if (!g_canRun) { Toast("Start playing first"); return; }
-    if (!CheatTablesOk()) { Toast("Cheat tables not found"); return; }
+    if (!g_canRun) { Toast(Tr("Start playing first")); return; }
+    if (!CheatTablesOk()) { Toast(Tr("Cheat tables not found")); return; }
     const CheatDef& c = kCheat[idx];
     if (c.group == kDangerGroup && !(g_armedIdx == idx && g_armedT > 0.f)) {
         g_armedIdx = idx; g_armedT = 2.5f;
-        Toast("Tap again to confirm");
+        Toast(Tr("Tap again to confirm"));
         return;
     }
     g_armedIdx = -1; g_armedT = 0.f;
     const bool wasOn = StateOf(idx);
     Enqueue(aCheat, idx);
     char msg[80];
-    snprintf(msg, sizeof(msg), "Cheat %s %s", c.name, wasOn ? "Deactivated" : "Activated");   // same wording as the original
+    if (g_lang == 1) { if (wasOn) snprintf(msg, sizeof(msg), "ปิดสูตร %s แล้ว", c.name); else snprintf(msg, sizeof(msg), "เปิดสูตร %s แล้ว", c.name); }
+    else             { snprintf(msg, sizeof(msg), "Cheat %s %s", c.name, wasOn ? "Deactivated" : "Activated"); }   // same wording as the original
     Toast(msg);
 }
 
@@ -506,6 +553,7 @@ static void Init(float scale) {
 // ========================================================================= pages
 static const ImU32 kBtnCol = IM_COL32(40, 48, 68, 255);
 static const ImU32 kDangerCol = IM_COL32(86, 44, 52, 255);
+static const ImU32 kAccentCol = IM_COL32(52, 120, 246, 255);
 
 static void PagePlayer() {
     const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
@@ -514,13 +562,13 @@ static void PagePlayer() {
     const bool ok = ped != nullptr;
 
     // wanted level 0..6
-    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "Wanted level");
+    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "%s", Tr("Wanted level"));
     {
         const float w = (RowWidth() - sp * 6.f) / 7.f;
         for (int lv = 0; lv <= 6; lv++) {
             if (lv) ImGui::SameLine();
             char t[4]; snprintf(t, sizeof(t), "%d", lv);
-            if (Btn(t, ImVec2(w, 92.f * sc), 380 + lv, kBtnCol, ok && g_cheatWanted != nullptr)) { Enqueue(aWanted, lv); Toast("Wanted level set"); }
+            if (Btn(t, ImVec2(w, 92.f * sc), 380 + lv, kBtnCol, ok && g_cheatWanted != nullptr)) { Enqueue(aWanted, lv); Toast(Tr("Wanted level set")); }
         }
     }
     ImGui::Spacing();
@@ -531,29 +579,29 @@ static void PagePlayer() {
     if (mx < 100.f) mx = 100.f;
     char v[48];
 
-    static const char* const kHp[] = {"Min", "Default", "Max"};
+    const char* const kHp[] = {Tr("Min"), Tr("Default"), Tr("Max")};
     snprintf(v, sizeof(v), ok ? "%d / %d" : "-", (int)(hp + 0.5f), (int)(mx + 0.5f));
-    int r = Stepper("Health", 400, v, "1", "10", kHp, 3, ok);
+    int r = Stepper(Tr("Health"), 400, v, "1", "10", kHp, 3, ok);
     if (r == -2) Enqueue(aHealth, 0, hp - 10.f); else if (r == -1) Enqueue(aHealth, 0, hp - 1.f);
     else if (r == 1) Enqueue(aHealth, 0, hp + 1.f); else if (r == 2) Enqueue(aHealth, 0, hp + 10.f);
     else if (r == 10) Enqueue(aHealth, 0, 1.f); else if (r == 11) Enqueue(aHealth, 0, 100.f); else if (r == 12) Enqueue(aHealth, 0, mx);
 
     snprintf(v, sizeof(v), ok ? "%d / 100" : "-", (int)(ar + 0.5f));
-    r = Stepper("Armour", 430, v, "1", "10", kHp, 3, ok);
+    r = Stepper(Tr("Armour"), 430, v, "1", "10", kHp, 3, ok);
     if (r == -2) Enqueue(aArmour, 0, ar - 10.f); else if (r == -1) Enqueue(aArmour, 0, ar - 1.f);
     else if (r == 1) Enqueue(aArmour, 0, ar + 1.f); else if (r == 2) Enqueue(aArmour, 0, ar + 10.f);
     else if (r == 10) Enqueue(aArmour, 0, 0.f); else if (r == 11) Enqueue(aArmour, 0, 0.f); else if (r == 12) Enqueue(aArmour, 0, 100.f);
 
-    static const char* const kMoney[] = {"$0", "$10k", "$1M", "Max"};
+    const char* const kMoney[] = {"$0", "$10k", "$1M", Tr("Max")};
     snprintf(v, sizeof(v), info ? "$%d" : "-", money);
-    r = Stepper("Money", 460, v, "1k", "100k", kMoney, 4, info != nullptr);
+    r = Stepper(Tr("Money"), 460, v, "1k", "100k", kMoney, 4, info != nullptr);
     const float m = (float)money;
     if (r == -2) Enqueue(aMoney, 0, m - 100000.f); else if (r == -1) Enqueue(aMoney, 0, m - 1000.f);
     else if (r == 1) Enqueue(aMoney, 0, m + 1000.f); else if (r == 2) Enqueue(aMoney, 0, m + 100000.f);
     else if (r == 10) Enqueue(aMoney, 0, 0.f); else if (r == 11) Enqueue(aMoney, 0, 10000.f);
     else if (r == 12) Enqueue(aMoney, 0, 1000000.f); else if (r == 13) Enqueue(aMoney, 0, 99999999.f);
 
-    if (!ok) ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "Start playing to edit these values");
+    if (!ok) ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "%s", Tr("Start playing to edit these values"));
     ImGui::Dummy(ImVec2(1.f, 90.f * sc));
 }
 
@@ -570,12 +618,12 @@ static void PageVehicle() {
             lastSec = v.section; secIdx++; n = 0;
             int count = 0; for (int j = i; j < kNumVeh && !strcmp(kVeh[j].section, v.section); j++) count++;
             open = g_expanded[20 + secIdx];
-            if (Header(v.section, count, 320 + secIdx, open)) g_expanded[20 + secIdx] = !g_expanded[20 + secIdx];
+            if (Header(Tr(v.section), count, 320 + secIdx, open)) g_expanded[20 + secIdx] = !g_expanded[20 + secIdx];
         }
         if (!open) continue;
         if (n % 3) ImGui::SameLine();
         if (Btn(v.label, ImVec2(colW, 96.f * sc), 2000 + i, kBtnCol, g_vehicleCheat != nullptr)) {
-            if (!g_canRun) Toast("Start playing first");
+            if (!g_canRun) Toast(Tr("Start playing first"));
             else { Enqueue(aVehicle, v.model); Toast(v.label); }
         }
         n++;
@@ -585,30 +633,30 @@ static void PageVehicle() {
 
 static void PageGame() {
     const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
-    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "Set game time");
+    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "%s", Tr("Set game time"));
     const float w = (RowWidth() - sp * 3.f) / 4.f;
     static const char* const kT[] = {"00:00", "06:00", "12:00", "18:00"};
     for (int k = 0; k < 4; k++) {
         if (k) ImGui::SameLine();
         if (Btn(kT[k], ImVec2(w, 96.f * sc), 340 + k, kBtnCol, g_setClock != nullptr)) {
-            if (!g_canRun) Toast("Start playing first"); else { Enqueue(aClock, k * 6); Toast(kT[k]); }
+            if (!g_canRun) Toast(Tr("Start playing first")); else { Enqueue(aClock, k * 6); Toast(kT[k]); }
         }
     }
     ImGui::Spacing();
-    ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "Weather and time cheats are in the Cheats tab.");
+    ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "%s", Tr("Weather and time cheats are in the Cheats tab."));
 }
 
 static void PageCheats() {
     const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
     if (!CheatTablesOk()) {
-        ImGui::TextColored(ImVec4(1.f, 0.55f, 0.45f, 1), "Cheat tables not found in this game version.");
+        ImGui::TextColored(ImVec4(1.f, 0.55f, 0.45f, 1), "%s", Tr("Cheat tables not found in this game version."));
         return;
     }
     const float colW = (RowWidth() - sp) * 0.5f;
     for (int g = 0; g < kNumGroups; g++) {
         int count = 0;
         for (int i = 0; i < kNumCheats; i++) if (kCheat[i].group == g) count++;
-        if (Header(kGroupName[g], count, 300 + g, g_expanded[g])) g_expanded[g] = !g_expanded[g];
+        if (Header(GroupLabel(g), count, 300 + g, g_expanded[g])) g_expanded[g] = !g_expanded[g];
         if (!g_expanded[g]) continue;
         int n = 0;
         for (int i = 0; i < kNumCheats; i++) {
@@ -616,9 +664,9 @@ static void PageCheats() {
             if (n % 2) ImGui::SameLine();
             const bool armed = (g_armedIdx == i && g_armedT > 0.f);
             const char* tag = nullptr; bool on = false;
-            if (!armed && IsToggle(i)) { on = StateOf(i); tag = on ? "ON" : "OFF"; }
+            if (!armed && IsToggle(i)) { on = StateOf(i); tag = on ? Tr("ON") : Tr("OFF"); }
             const ImU32 fill = armed ? IM_COL32(190, 70, 40, 255) : (g == kDangerGroup ? kDangerCol : kBtnCol);
-            if (Btn(armed ? "TAP AGAIN" : kCheat[i].label, ImVec2(colW, 96.f * sc), 1000 + i, fill, true, tag, on)) OnCheatTap(i);
+            if (Btn(armed ? Tr("TAP AGAIN") : CheatLabel(i), ImVec2(colW, 96.f * sc), 1000 + i, fill, true, tag, on)) OnCheatTap(i);
             n++;
         }
     }
@@ -626,28 +674,40 @@ static void PageCheats() {
 }
 
 static void PageMenu() {
-    const float sc = g_sc;
+    const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
     const float sq = 88.f * sc, wide = RowWidth(), btnH = 96.f * sc;
-    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "Floating button");
-    ImGui::Text("Opacity: %d%%", (int)(g_btnAlpha * 100.f + 0.5f));
+    const ImVec4 hdr(0.45f, 0.62f, 1.f, 1.f), dim(0.55f, 0.60f, 0.70f, 1);
+
+    ImGui::TextColored(hdr, "%s", g_thaiOk ? "Language / ภาษา" : "Language");
+    {
+        const float lw = (wide - sp) * 0.5f;
+        if (Btn("English", ImVec2(lw, btnH), 40, g_lang == 0 ? kAccentCol : kBtnCol)) { g_lang = 0; g_saveReq = true; }
+        ImGui::SameLine();
+        if (Btn(g_thaiOk ? "ไทย" : "Thai", ImVec2(lw, btnH), 41, g_lang == 1 ? kAccentCol : kBtnCol, g_thaiOk)) { g_lang = 1; g_saveReq = true; }
+        if (!g_thaiOk) ImGui::TextColored(dim, "Thai font not found. Put a Thai .ttf at files/ProMenu/font_th.ttf");
+    }
+    ImGui::Spacing();
+
+    ImGui::TextColored(hdr, "%s", Tr("Floating button"));
+    ImGui::Text(Tr("Opacity: %d%%"), (int)(g_btnAlpha * 100.f + 0.5f));
     if (Btn("-", ImVec2(sq, sq), 30, kBtnCol)) { g_btnAlpha = Clamp(g_btnAlpha - 0.10f, 0.15f, 1.f); g_saveReq = true; }
     ImGui::SameLine();
     if (Btn("+", ImVec2(sq, sq), 31, kBtnCol)) { g_btnAlpha = Clamp(g_btnAlpha + 0.10f, 0.15f, 1.f); g_saveReq = true; }
-    ImGui::Text("Size: %d%%", (int)(g_btnScale * 100.f + 0.5f));
+    ImGui::Text(Tr("Size: %d%%"), (int)(g_btnScale * 100.f + 0.5f));
     if (Btn("-", ImVec2(sq, sq), 32, kBtnCol)) { g_btnScale = Clamp(g_btnScale - 0.10f, 0.70f, 1.50f); g_saveReq = true; }
     ImGui::SameLine();
     if (Btn("+", ImVec2(sq, sq), 33, kBtnCol)) { g_btnScale = Clamp(g_btnScale + 0.10f, 0.70f, 1.50f); g_saveReq = true; }
-    if (Btn("Fade when idle", ImVec2(wide, btnH), 35, kBtnCol, true, g_fadeIdle ? "ON" : "OFF", g_fadeIdle)) { g_fadeIdle = !g_fadeIdle; g_saveReq = true; }
-    if (Btn("Lock position", ImVec2(wide, btnH), 36, kBtnCol, true, g_lockPos ? "ON" : "OFF", g_lockPos)) { g_lockPos = !g_lockPos; g_saveReq = true; }
-    if (Btn("Reset position", ImVec2(wide, btnH), 34, kBtnCol)) { g_posInit = false; g_cfgFx = g_cfgFy = -1.f; g_saveReq = true; }
+    if (Btn(Tr("Fade when idle"), ImVec2(wide, btnH), 35, kBtnCol, true, g_fadeIdle ? Tr("ON") : Tr("OFF"), g_fadeIdle)) { g_fadeIdle = !g_fadeIdle; g_saveReq = true; }
+    if (Btn(Tr("Lock position"), ImVec2(wide, btnH), 36, kBtnCol, true, g_lockPos ? Tr("ON") : Tr("OFF"), g_lockPos)) { g_lockPos = !g_lockPos; g_saveReq = true; }
+    if (Btn(Tr("Reset position"), ImVec2(wide, btnH), 34, kBtnCol)) { g_posInit = false; g_cfgFx = g_cfgFy = -1.f; g_saveReq = true; }
     ImGui::Spacing();
-    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "About");
-    const ImVec4 dim(0.55f, 0.60f, 0.70f, 1);
-    ImGui::TextColored(dim, "ProMenu 0.4");
-    ImGui::TextColored(dim, "Game state: %d    Game symbols: %d/9", g_dbgGameState, g_dbgFound);
-    ImGui::TextColored(dim, "Cheat tables: %s", CheatTablesOk() ? "found" : "missing");
-    ImGui::TextColored(dim, "Touches: %d    Taps: %d", (int)g_dbgTouches, (int)g_dbgTaps);
-    ImGui::TextColored(dim, "Raw events  up: %d  down: %d  move: %d", (int)g_dbgRaw[1], (int)g_dbgRaw[2], (int)g_dbgRaw[3]);
+
+    ImGui::TextColored(hdr, "%s", Tr("About"));
+    ImGui::TextColored(dim, "ProMenu 0.5");
+    ImGui::TextColored(dim, Tr("Game state: %d    Game symbols: %d/9"), g_dbgGameState, g_dbgFound);
+    ImGui::TextColored(dim, Tr("Cheat tables: %s"), CheatTablesOk() ? Tr("found") : Tr("missing"));
+    ImGui::TextColored(dim, Tr("Touches: %d    Taps: %d"), (int)g_dbgTouches, (int)g_dbgTaps);
+    ImGui::TextColored(dim, Tr("Raw events  up: %d  down: %d  move: %d"), (int)g_dbgRaw[1], (int)g_dbgRaw[2], (int)g_dbgRaw[3]);
     ImGui::Dummy(ImVec2(1.f, 60.f * sc));
 }
 
@@ -751,7 +811,7 @@ static void Draw(float W, float H, float dt) {
     const ImU32 kAccent = IM_COL32(52, 120, 246, 255);
 
     ImGui::SetCursorPos(ImVec2(18.f * sc, (hh - ImGui::GetFontSize()) * 0.5f));
-    ImGui::TextColored(ImVec4(1, 1, 1, 1), "CHEAT MENU");
+    ImGui::TextColored(ImVec4(1, 1, 1, 1), "%s", Tr("CHEAT MENU"));
     {
         const float cs = 90.f * sc;
         ImGui::SetCursorPos(ImVec2(pw - cs - 26.f * sc, (hh - cs) * 0.5f));
@@ -765,7 +825,7 @@ static void Draw(float W, float H, float dt) {
     // sidebar
     ImGui::BeginChild("##side", ImVec2(sideW, bodyH), 0, ImGuiWindowFlags_NoScrollbar);
     for (int t = 0; t < kTabCount; t++)
-        if (Btn(kTabs[t], ImVec2(ImGui::GetContentRegionAvail().x, btnH), 1 + t, g_tab == t ? kAccent : kBtnCol)) g_tab = t;
+        if (Btn(Tr(kTabs[t]), ImVec2(ImGui::GetContentRegionAvail().x, btnH), 1 + t, g_tab == t ? kAccent : kBtnCol)) g_tab = t;
     ImGui::EndChild();
 
     ImGui::SameLine();

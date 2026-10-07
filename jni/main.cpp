@@ -8,8 +8,11 @@
 //   CClock::Update                    -> game tick: run queued cheats
 #include <mod/amlmod.h>
 #include <mod/logger.h>
+#include <ctype.h>
+#include <dirent.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include "imgui.h"
 
@@ -59,6 +62,39 @@ static bool ScreenSize(float& w, float& h) {
     return w > 0.f && h > 0.f;
 }
 
+static bool ContainsI(const char* hay, const char* needle) {
+    const size_t n = strlen(needle);
+    for (; *hay; hay++) {
+        size_t i = 0;
+        while (i < n && hay[i] && tolower((unsigned char)hay[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == n) return true;
+    }
+    return false;
+}
+
+// Android ships a Thai font in its system font folders; pick the plain Sans/Regular one
+static bool FindSystemThaiFont(char* out, size_t cap) {
+    static const char* kDirs[] = {"/system/fonts", "/product/fonts", "/system/product/fonts", "/system_ext/fonts", "/vendor/fonts"};
+    int best = -1;
+    for (const char* dir : kDirs) {
+        DIR* d = opendir(dir);
+        if (!d) continue;
+        while (dirent* e = readdir(d)) {
+            const char* nm = e->d_name;
+            if (!ContainsI(nm, "thai")) continue;
+            if (!ContainsI(nm, ".ttf") && !ContainsI(nm, ".otf") && !ContainsI(nm, ".ttc")) continue;
+            int score = 1;
+            if (ContainsI(nm, "sans")) score += 2;
+            if (ContainsI(nm, "regular")) score += 3;
+            if (ContainsI(nm, "serif") || ContainsI(nm, "bold") || ContainsI(nm, "light") || ContainsI(nm, "thin") ||
+                ContainsI(nm, "black") || ContainsI(nm, "medium") || ContainsI(nm, "italic") || ContainsI(nm, "looped")) score -= 6;
+            if (score > best) { best = score; snprintf(out, cap, "%s/%s", dir, nm); }
+        }
+        closedir(d);
+    }
+    return best > 0;
+}
+
 static bool InitImGui() {
     if (!RWB::Resolve()) return false;
 
@@ -97,6 +133,29 @@ static bool InitImGui() {
         cfg.SizePixels = 34.f * sc;
         io.Fonts->AddFontDefault(&cfg);
         logger->Info("font: built-in");
+    }
+
+    // Thai glyphs go into the same font (merge mode), so one atlas serves both languages
+    {
+        static const ImWchar kThai[] = { 0x0E00, 0x0E7F, 0 };
+        char sys[512] = "";
+        const char* cands[3] = {
+            "/storage/emulated/0/Android/data/com.rockstargames.gtasa/files/ProMenu/font_th.ttf",
+            "/sdcard/Android/data/com.rockstargames.gtasa/files/ProMenu/font_th.ttf",
+            nullptr,
+        };
+        if (FindSystemThaiFont(sys, sizeof(sys))) cands[2] = sys;
+        for (const char* path : cands) {
+            if (!path || !FileExists(path)) continue;
+            ImFontConfig tc;
+            tc.MergeMode = true;
+            if (io.Fonts->AddFontFromFileTTF(path, 34.f * sc, &tc, kThai)) {
+                UI::g_thaiOk = true;
+                logger->Info("thai font: %s", path);
+                break;
+            }
+        }
+        if (!UI::g_thaiOk) logger->Info("no Thai font found, Thai disabled");
     }
 
     UI::Init(sc);
