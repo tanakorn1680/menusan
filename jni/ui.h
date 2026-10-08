@@ -60,6 +60,17 @@ static void* (*g_getPlayerInfo)(void*) = nullptr;   // CPlayerPed::GetPlayerInfo
 static unsigned char* g_pCurrentDay = nullptr;      // CClock::CurrentDay
 static bool* g_pGodFlag = nullptr;                  // CPlayerPed::bDebugPlayerInvincible
 static int g_godIdx = -1;                           // index of INVINCIBILITY in the cheat list
+struct Vec3 { float x, y, z; };
+static Vec3 (*g_getCoors)(int) = nullptr;           // FindPlayerCoors(0)
+static float* g_pTimeScale = nullptr;               // CTimer::ms_fTimeScale
+static unsigned char* g_pClockH = nullptr;          // CClock::ms_nGameClockHours
+static unsigned char* g_pClockM = nullptr;          // CClock::ms_nGameClockMinutes
+static unsigned int* g_pMsPerMin = nullptr;         // CClock::ms_nMillisecondsPerGameMinute
+static void (*g_forceWeather)(short) = nullptr;     // CWeather::ForceWeather
+static void (*g_releaseWeather)() = nullptr;        // CWeather::ReleaseWeather
+static bool* g_pTopEnable = nullptr;                // TopDownCamera::m_bEnable
+static int* g_pTopZoom = nullptr;                   // TopDownCamera::m_nZoom
+static const int kNumSyms = 18;                     // how many game symbols ResolveGame looks for
 
 // Field offsets inside the 64-bit game structures (read from the original menu's code)
 static const int kOffHealth = 0x6AC, kOffMaxHealth = 0x6B0, kOffArmour = 0x6B4;   // CPed
@@ -71,7 +82,7 @@ template <typename T> static void Res(uintptr_t (*lookup)(const char*), T& out, 
     if (a) found++;
 }
 
-// returns how many of the 10 essential game symbols were found
+// returns how many of the kNumSyms game symbols were found
 static int ResolveGame(uintptr_t (*lookup)(const char*)) {
     int found = 0;
     Res(lookup, g_cheatFns, "_ZN6CCheat17m_aCheatFunctionsE", found);
@@ -83,6 +94,15 @@ static int ResolveGame(uintptr_t (*lookup)(const char*)) {
     Res(lookup, g_getPlayerInfo, "_ZN10CPlayerPed29GetPlayerInfoForThisPlayerPedEv", found);
     Res(lookup, g_pCurrentDay, "_ZN6CClock10CurrentDayE", found);
     Res(lookup, g_pGodFlag, "_ZN10CPlayerPed22bDebugPlayerInvincibleE", found);
+    Res(lookup, g_getCoors, "_Z15FindPlayerCoorsi", found);
+    Res(lookup, g_pTimeScale, "_ZN6CTimer13ms_fTimeScaleE", found);
+    Res(lookup, g_pClockH, "_ZN6CClock18ms_nGameClockHoursE", found);
+    Res(lookup, g_pClockM, "_ZN6CClock20ms_nGameClockMinutesE", found);
+    Res(lookup, g_pMsPerMin, "_ZN6CClock29ms_nMillisecondsPerGameMinuteE", found);
+    Res(lookup, g_forceWeather, "_ZN8CWeather12ForceWeatherEs", found);
+    Res(lookup, g_releaseWeather, "_ZN8CWeather14ReleaseWeatherEv", found);
+    Res(lookup, g_pTopEnable, "_ZN13TopDownCamera9m_bEnableE", found);
+    Res(lookup, g_pTopZoom, "_ZN13TopDownCamera7m_nZoomE", found);
     for (int i = 0; i < kNumCheats; i++) if (!strcmp(kCheat[i].name, "INVINCIBILITY")) g_godIdx = i;
     return found;
 }
@@ -117,7 +137,7 @@ static char* PlayerInfo(char* ped) { return (ped && g_getPlayerInfo) ? (char*)g_
 
 // ============================================================ action queue
 // The UI never touches the game directly; it queues actions that run inside the game's update tick.
-enum { aCheat = 0, aVehicle, aClock, aWanted, aHealth, aArmour, aMoney };
+enum { aCheat = 0, aVehicle, aClock, aWanted, aHealth, aArmour, aMoney, aTimeScale, aClockHM, aDay, aDayLen, aWeather, aTopDown, aTopZoom };
 struct Act { int kind; int i; float f; };
 static const int kQueueSize = 32;
 static Act g_queue[kQueueSize];
@@ -130,7 +150,22 @@ static void Enqueue(int kind, int i, float f = 0.f) {
     g_qTail = next;
 }
 
+static bool g_syncTime = false;                    // Game > Sync to system time
+static int g_lastSyncH = -1, g_lastSyncM = -1;
+
+// keeps the in-game clock equal to the phone's clock (only touches it when the real minute changes)
+static void SyncTick(bool running) {
+    if (!g_syncTime || !running || !g_setClock) return;
+    time_t t = time(nullptr);
+    struct tm lt;
+    localtime_r(&t, &lt);
+    if (lt.tm_hour == g_lastSyncH && lt.tm_min == g_lastSyncM) return;
+    g_lastSyncH = lt.tm_hour; g_lastSyncM = lt.tm_min;
+    g_setClock((unsigned char)lt.tm_hour, (unsigned char)lt.tm_min, g_pCurrentDay ? *g_pCurrentDay : 0);
+}
+
 static void RunQueued(bool gameIsRunning) {
+    SyncTick(gameIsRunning);
     while (g_qHead != g_qTail) {
         const Act a = g_queue[g_qHead];
         g_qHead = (g_qHead + 1) % kQueueSize;
@@ -159,6 +194,21 @@ static void RunQueued(bool gameIsRunning) {
                 if (info) *(int*)(info + kOffMoney) = (int)Clamp(a.f, 0.f, 99999999.f);
                 break;
             }
+            case aTimeScale: if (g_pTimeScale) *g_pTimeScale = Clamp(a.f, 0.1f, 10.f); break;
+            case aClockHM:
+                if (g_setClock) {
+                    int h = ((a.i % 24) + 24) % 24, m = (((int)a.f % 60) + 60) % 60;
+                    g_setClock((unsigned char)h, (unsigned char)m, g_pCurrentDay ? *g_pCurrentDay : 0);
+                }
+                break;
+            case aDay: if (g_pCurrentDay && a.i >= 1 && a.i <= 7) *g_pCurrentDay = (unsigned char)a.i; break;
+            case aDayLen: if (g_pMsPerMin) *g_pMsPerMin = (unsigned int)(Clamp(a.f, 1.f, 180.f) * (60000.f / 1440.f)); break;
+            case aWeather:
+                if (a.i < 0) { if (g_releaseWeather) g_releaseWeather(); }
+                else if (g_forceWeather) g_forceWeather((short)a.i);
+                break;
+            case aTopDown: if (g_pTopEnable) *g_pTopEnable = (a.i != 0); break;
+            case aTopZoom: if (g_pTopZoom) *g_pTopZoom = (int)Clamp(a.f, 20.f, 60.f); break;
         }
     }
 }
@@ -177,6 +227,10 @@ static bool g_fadeIdle = true;
 static bool g_lockPos = false;                    // when on, the floating button cannot be dragged
 static int g_lang = 0;                            // 0 = English, 1 = Thai
 static bool g_thaiOk = false;                     // a Thai font was loaded (set by main.cpp)
+// on-screen info overlay (Menu > Overlay)
+static bool g_ovFps = false, g_ovCoords = false, g_ovPlay = false, g_ovNoBg = false, g_ovRgb = false;
+static int g_ovPos = 1, g_ovColor = 0;            // position 0..4 (TL, TC, TR, BL, BR), colour 0..5
+static float g_fps = 60.f, g_playSec = 0.f, g_ovHue = 0.f;
 static int g_tab = kTabCheats, g_lastTab = -1;
 static char g_toast[80] = "";
 static float g_toastT = 0.f;
@@ -333,13 +387,15 @@ static void LoadConfig() {
         snprintf(path, sizeof(path), "%s/config.txt", kCfgDirs[i]);
         FILE* f = fopen(path, "r");
         if (!f) continue;
-        float fx, fy, a, s; int fade, lock = 0, lang = 0;
-        if (fscanf(f, "%f %f %f %f %d %d %d", &fx, &fy, &a, &s, &fade, &lock, &lang) >= 5) {
+        float fx, fy, a, s; int fade, lock = 0, lang = 0, ovf = 0, ovp = 1, ovc = 0;
+        if (fscanf(f, "%f %f %f %f %d %d %d %d %d %d", &fx, &fy, &a, &s, &fade, &lock, &lang, &ovf, &ovp, &ovc) >= 5) {
             g_cfgFx = Clamp(fx, 0.f, 1.f); g_cfgFy = Clamp(fy, 0.f, 1.f);
             g_btnAlpha = Clamp(a, 0.15f, 1.f); g_btnScale = Clamp(s, 0.7f, 1.5f);
             g_fadeIdle = fade != 0;
             g_lockPos = lock != 0;
             g_lang = (lang == 1 && g_thaiOk) ? 1 : 0;
+            g_ovFps = (ovf & 1) != 0; g_ovCoords = (ovf & 2) != 0; g_ovPlay = (ovf & 4) != 0; g_ovNoBg = (ovf & 8) != 0; g_ovRgb = (ovf & 16) != 0;
+            g_ovPos = (int)Clamp((float)ovp, 0.f, 4.f); g_ovColor = (int)Clamp((float)ovc, 0.f, 5.f);
         }
         fclose(f);
         return;
@@ -353,7 +409,8 @@ static void SaveConfig(float W, float H) {
         snprintf(path, sizeof(path), "%s/config.txt", kCfgDirs[i]);
         FILE* f = fopen(path, "w");
         if (!f) continue;
-        fprintf(f, "%.5f %.5f %.3f %.3f %d %d %d\n", g_fabX / W, g_fabY / H, g_btnAlpha, g_btnScale, g_fadeIdle ? 1 : 0, g_lockPos ? 1 : 0, g_lang);
+        const int ovf = (g_ovFps ? 1 : 0) | (g_ovCoords ? 2 : 0) | (g_ovPlay ? 4 : 0) | (g_ovNoBg ? 8 : 0) | (g_ovRgb ? 16 : 0);
+        fprintf(f, "%.5f %.5f %.3f %.3f %d %d %d %d %d %d\n", g_fabX / W, g_fabY / H, g_btnAlpha, g_btnScale, g_fadeIdle ? 1 : 0, g_lockPos ? 1 : 0, g_lang, ovf, g_ovPos, g_ovColor);
         fclose(f);
         return;
     }
@@ -375,13 +432,26 @@ static const TrPair kTr[] = {
     {"Cars", "รถยนต์"}, {"Bikes", "มอเตอร์ไซค์"}, {"Trucks, off-road & special", "รถบรรทุก ออฟโรด และพิเศษ"},
     {"Air", "อากาศยาน"}, {"Sea", "เรือ"},
     {"Set game time", "ตั้งเวลาในเกม"},
+    {"Switches", "สวิตช์"}, {"Sync to system time", "ซิงก์เวลากับเครื่อง"},
+    {"Game speed", "ความเร็วเกม"}, {"Time of day", "เวลาในเกม"}, {"Hour", "ชั่วโมง"}, {"Minute", "นาที"},
+    {"Day length (min)", "ความยาววัน (นาที)"}, {"Day of week", "วันในสัปดาห์"},
+    {"Sunday", "อาทิตย์"}, {"Monday", "จันทร์"}, {"Tuesday", "อังคาร"}, {"Wednesday", "พุธ"},
+    {"Thursday", "พฤหัสบดี"}, {"Friday", "ศุกร์"}, {"Saturday", "เสาร์"},
+    {"Weather", "อากาศ"}, {"Extra sunny", "แดดจ้า"}, {"Sunny", "แดดออก"}, {"Cloudy", "มีเมฆ"}, {"Rainy", "ฝนตก"},
+    {"Foggy", "หมอก"}, {"Thunderstorm", "พายุฝนฟ้าคะนอง"}, {"Sandstorm", "พายุทราย"}, {"Auto", "อัตโนมัติ"},
+    {"Top-down camera", "กล้องมุมสูง"}, {"Enabled", "เปิดใช้งาน"}, {"Camera zoom", "ซูมกล้อง"},
+    {"Overlay", "โอเวอร์เลย์"}, {"Show FPS", "แสดง FPS"}, {"Show coordinates", "แสดงพิกัด"}, {"Show playtime", "แสดงเวลาเล่น"},
+    {"No background", "ไม่มีพื้นหลัง"}, {"RGB cycle text", "ตัวอักษรไล่สี RGB"}, {"Position", "ตำแหน่ง"},
+    {"Top left", "บนซ้าย"}, {"Top center", "บนกลาง"}, {"Top right", "บนขวา"}, {"Bottom left", "ล่างซ้าย"}, {"Bottom right", "ล่างขวา"},
+    {"Text color", "สีตัวอักษร"}, {"White", "ขาว"}, {"Yellow", "เหลือง"}, {"Green", "เขียว"}, {"Cyan", "ฟ้า"}, {"Pink", "ชมพู"}, {"Orange", "ส้ม"},
+    {"Playtime", "เวลาเล่น"},
     {"Weather and time cheats are in the Cheats tab.", "สูตรอากาศและเวลาอยู่ในแท็บสูตรโกง"},
     {"Cheat tables not found in this game version.", "ไม่พบตารางสูตรในเกมเวอร์ชันนี้"},
     {"Floating button", "ปุ่มลอย"},
     {"Opacity: %d%%", "ความโปร่งใส: %d%%"}, {"Size: %d%%", "ขนาด: %d%%"},
     {"Fade when idle", "จางเมื่อไม่แตะ"}, {"Lock position", "ล็อกตำแหน่ง"}, {"Reset position", "รีเซ็ตตำแหน่ง"},
     {"Language", "ภาษา"}, {"About", "เกี่ยวกับ"},
-    {"Game state: %d    Game symbols: %d/9", "สถานะเกม: %d    สัญลักษณ์เกม: %d/9"},
+    {"Game state: %d    Game symbols: %d/%d", "สถานะเกม: %d    สัญลักษณ์เกม: %d/%d"},
     {"Cheat tables: %s", "ตารางสูตร: %s"}, {"found", "พบ"}, {"missing", "ไม่พบ"},
     {"Touches: %d    Taps: %d", "สัมผัส: %d    แตะ: %d"},
     {"Raw events  up: %d  down: %d  move: %d", "เหตุการณ์ดิบ  ยก: %d  กด: %d  เลื่อน: %d"},
@@ -548,6 +618,57 @@ static void Init(float scale) {
     st.Colors[ImGuiCol_ScrollbarGrab] = ImVec4(1, 1, 1, 0.22f);
     g_expanded[0] = true;        // first cheat group
     g_expanded[20] = true;       // first vehicle section
+    g_expanded[30] = g_expanded[31] = g_expanded[32] = true;   // Game: switches, speed, time
+}
+
+// ===================================================================== overlay
+static const ImU32 kOvCols[6] = {IM_COL32(255,255,255,255), IM_COL32(255,226,80,255), IM_COL32(120,230,120,255),
+                                 IM_COL32(90,220,255,255), IM_COL32(255,130,200,255), IM_COL32(255,170,60,255)};
+
+static ImU32 HueColor(float h) {                       // fully saturated colour from a 0..1 hue
+    h = h - floorf(h);
+    const float x = h * 6.f; const int i = (int)x; const float f = x - (float)i;
+    float r = 1.f, g = 1.f, b = 1.f;
+    switch (i % 6) {
+        case 0: r = 1; g = f; b = 0; break;       case 1: r = 1 - f; g = 1; b = 0; break;
+        case 2: r = 0; g = 1; b = f; break;       case 3: r = 0; g = 1 - f; b = 1; break;
+        case 4: r = f; g = 0; b = 1; break;       default: r = 1; g = 0; b = 1 - f; break;
+    }
+    return IM_COL32((int)(r * 255), (int)(g * 255), (int)(b * 255), 255);
+}
+
+// FPS / coordinates / playtime in a corner of the screen (drawn only, never takes touches)
+static void DrawOverlay(float W, float H, float dt) {
+    if (!(g_ovFps || g_ovCoords || g_ovPlay)) return;
+    const float sc = g_sc;
+    char lines[3][96]; int n = 0;
+    if (g_ovFps) snprintf(lines[n++], sizeof(lines[0]), "FPS: %d", (int)(g_fps + 0.5f));
+    if (g_ovCoords) {
+        if (g_canRun && g_getCoors) { const Vec3 c = g_getCoors(0); snprintf(lines[n++], sizeof(lines[0]), "X: %.1f  Y: %.1f  Z: %.1f", c.x, c.y, c.z); }
+        else snprintf(lines[n++], sizeof(lines[0]), "X: -  Y: -  Z: -");
+    }
+    if (g_ovPlay) {
+        const int t = (int)g_playSec;
+        snprintf(lines[n++], sizeof(lines[0]), "%s: %02d:%02d:%02d", Tr("Playtime"), t / 3600, (t / 60) % 60, t % 60);
+    }
+    g_ovHue += dt * 0.25f;
+    const ImU32 col = g_ovRgb ? HueColor(g_ovHue) : kOvCols[g_ovColor];
+    const float fs = ImGui::GetFontSize() * 0.78f, pad = 14.f * sc, lh = fs * 1.25f;
+    float tw = 0.f;
+    for (int i = 0; i < n; i++) { const float w = ImGui::CalcTextSize(lines[i]).x * 0.78f; if (w > tw) tw = w; }
+    const float bw = tw + pad * 2.f, bh = lh * (float)n + pad * 2.f - (lh - fs), m = 24.f * sc;
+    float x = m, y = m;
+    switch (g_ovPos) {
+        case 1: x = (W - bw) * 0.5f; break;
+        case 2: x = W - bw - m; break;
+        case 3: y = H - bh - m; break;
+        case 4: x = W - bw - m; y = H - bh - m; break;
+        default: break;
+    }
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    if (!g_ovNoBg) dl->AddRectFilled(ImVec2(x, y), ImVec2(x + bw, y + bh), IM_COL32(0, 0, 0, 120), 12.f * sc);
+    for (int i = 0; i < n; i++)
+        dl->AddText(ImGui::GetFont(), fs, ImVec2(x + pad, y + pad + lh * (float)i), col, lines[i]);
 }
 
 // ========================================================================= pages
@@ -631,19 +752,107 @@ static void PageVehicle() {
     ImGui::Dummy(ImVec2(1.f, 90.f * sc));
 }
 
-static void PageGame() {
-    const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
-    ImGui::TextColored(ImVec4(0.45f, 0.62f, 1.f, 1.f), "%s", Tr("Set game time"));
-    const float w = (RowWidth() - sp * 3.f) / 4.f;
-    static const char* const kT[] = {"00:00", "06:00", "12:00", "18:00"};
-    for (int k = 0; k < 4; k++) {
+// a toggle row with an ON/OFF badge
+static bool ToggleRow(const char* label, int id, bool on, bool enabled = true) {
+    return Btn(label, ImVec2(RowWidth(), 96.f * g_sc), id, kBtnCol, enabled, on ? Tr("ON") : Tr("OFF"), on);
+}
+
+// row of equal-width chips; returns the tapped index or -1
+static int ChipRow(const char* const* labels, int n, int idBase, int selected, bool enabled) {
+    const float sp = ImGui::GetStyle().ItemSpacing.x;
+    const float w = (RowWidth() - sp * (float)(n - 1)) / (float)n;
+    int r = -1;
+    for (int k = 0; k < n; k++) {
         if (k) ImGui::SameLine();
-        if (Btn(kT[k], ImVec2(w, 96.f * sc), 340 + k, kBtnCol, g_setClock != nullptr)) {
-            if (!g_canRun) Toast(Tr("Start playing first")); else { Enqueue(aClock, k * 6); Toast(kT[k]); }
-        }
+        if (Btn(labels[k], ImVec2(w, 92.f * g_sc), idBase + k, k == selected ? kAccentCol : kBtnCol, enabled)) r = k;
     }
-    ImGui::Spacing();
+    return r;
+}
+
+static bool Section(const char* label, int expIdx, int id) {
+    if (Header(label, 0, id, g_expanded[expIdx])) g_expanded[expIdx] = !g_expanded[expIdx];
+    return g_expanded[expIdx];
+}
+
+static void PageGame() {
+    const float sc = g_sc;
+    const bool run = g_canRun;
+    char v[48];
+
+    if (Section(Tr("Switches"), 30, 350)) {
+        if (ToggleRow(Tr("Sync to system time"), 360, g_syncTime, g_setClock != nullptr)) { g_syncTime = !g_syncTime; g_lastSyncH = -1; }
+        ImGui::Spacing();
+    }
+
+    if (Section(Tr("Game speed"), 31, 351)) {
+        const float ts = g_pTimeScale ? *g_pTimeScale : 1.f;
+        snprintf(v, sizeof(v), "x%.1f", ts);
+        const char* pre[] = {"x0.5", "x1", "x2", "x5"};
+        const int r = Stepper(Tr("Game speed"), 500, v, "0.1", "1", pre, 4, run && g_pTimeScale);
+        if (r == -2) Enqueue(aTimeScale, 0, ts - 1.f); else if (r == -1) Enqueue(aTimeScale, 0, ts - 0.1f);
+        else if (r == 1) Enqueue(aTimeScale, 0, ts + 0.1f); else if (r == 2) Enqueue(aTimeScale, 0, ts + 1.f);
+        else if (r >= 10) { static const float pv[] = {0.5f, 1.f, 2.f, 5.f}; Enqueue(aTimeScale, 0, pv[r - 10]); }
+    }
+
+    if (Section(Tr("Time of day"), 32, 352)) {
+        const int h = g_pClockH ? *g_pClockH : 0, m = g_pClockM ? *g_pClockM : 0;
+        const bool ok = run && g_setClock && g_pClockH && g_pClockM;
+        snprintf(v, sizeof(v), "%02d", h);
+        int r = Stepper(Tr("Hour"), 530, v, "1", "6", nullptr, 0, ok);
+        if (r == -2) Enqueue(aClockHM, h - 6, (float)m); else if (r == -1) Enqueue(aClockHM, h - 1, (float)m);
+        else if (r == 1) Enqueue(aClockHM, h + 1, (float)m); else if (r == 2) Enqueue(aClockHM, h + 6, (float)m);
+        snprintf(v, sizeof(v), "%02d", m);
+        r = Stepper(Tr("Minute"), 560, v, "1", "10", nullptr, 0, ok);
+        if (r == -2) Enqueue(aClockHM, h, (float)(m - 10)); else if (r == -1) Enqueue(aClockHM, h, (float)(m - 1));
+        else if (r == 1) Enqueue(aClockHM, h, (float)(m + 1)); else if (r == 2) Enqueue(aClockHM, h, (float)(m + 10));
+        static const char* const kT[] = {"00:00", "06:00", "12:00", "18:00"};
+        const int k = ChipRow(kT, 4, 340, -1, ok);
+        if (k >= 0) { Enqueue(aClockHM, k * 6, 0.f); Toast(kT[k]); }
+        ImGui::Spacing();
+        const float dl = g_pMsPerMin ? (float)*g_pMsPerMin / (60000.f / 1440.f) : 24.f;
+        snprintf(v, sizeof(v), "%d", (int)(dl + 0.5f));
+        const char* pre[] = {"5", "24", "60"};
+        r = Stepper(Tr("Day length (min)"), 590, v, "1", "10", pre, 3, run && g_pMsPerMin);
+        if (r == -2) Enqueue(aDayLen, 0, dl - 10.f); else if (r == -1) Enqueue(aDayLen, 0, dl - 1.f);
+        else if (r == 1) Enqueue(aDayLen, 0, dl + 1.f); else if (r == 2) Enqueue(aDayLen, 0, dl + 10.f);
+        else if (r >= 10) { static const float pv[] = {5.f, 24.f, 60.f}; Enqueue(aDayLen, 0, pv[r - 10]); }
+    }
+
+    if (Section(Tr("Day of week"), 33, 353)) {
+        const char* names[7] = {Tr("Sunday"), Tr("Monday"), Tr("Tuesday"), Tr("Wednesday"), Tr("Thursday"), Tr("Friday"), Tr("Saturday")};
+        const int cur = g_pCurrentDay ? (int)*g_pCurrentDay - 1 : -1;
+        int k = ChipRow(names, 4, 720, cur, run && g_pCurrentDay);
+        if (k >= 0) Enqueue(aDay, k + 1);
+        k = ChipRow(names + 4, 3, 724, cur - 4, run && g_pCurrentDay);
+        if (k >= 0) Enqueue(aDay, k + 5);
+        ImGui::Spacing();
+    }
+
+    if (Section(Tr("Weather"), 34, 354)) {
+        const char* names[8] = {Tr("Extra sunny"), Tr("Sunny"), Tr("Cloudy"), Tr("Rainy"), Tr("Foggy"), Tr("Thunderstorm"), Tr("Sandstorm"), Tr("Auto")};
+        static const int ids[8] = {0, 1, 4, 8, 9, 16, 19, -1};
+        int k = ChipRow(names, 4, 700, -1, run && g_forceWeather);
+        if (k >= 0) { Enqueue(aWeather, ids[k]); Toast(names[k]); }
+        k = ChipRow(names + 4, 4, 704, -1, run && g_forceWeather);
+        if (k >= 0) { Enqueue(aWeather, ids[4 + k]); Toast(names[4 + k]); }
+        ImGui::Spacing();
+    }
+
+    if (Section(Tr("Top-down camera"), 35, 355)) {
+        const bool on = g_pTopEnable && *g_pTopEnable;
+        if (ToggleRow(Tr("Enabled"), 361, on, run && g_pTopEnable)) Enqueue(aTopDown, on ? 0 : 1);
+        const int z = g_pTopZoom ? *g_pTopZoom : 40;
+        snprintf(v, sizeof(v), "%d", z);
+        const char* pre[] = {Tr("Min"), Tr("Default"), Tr("Max")};
+        const int r = Stepper(Tr("Camera zoom"), 620, v, "1", "5", pre, 3, run && g_pTopZoom);
+        if (r == -2) Enqueue(aTopZoom, 0, (float)(z - 5)); else if (r == -1) Enqueue(aTopZoom, 0, (float)(z - 1));
+        else if (r == 1) Enqueue(aTopZoom, 0, (float)(z + 1)); else if (r == 2) Enqueue(aTopZoom, 0, (float)(z + 5));
+        else if (r == 10) Enqueue(aTopZoom, 0, 20.f); else if (r == 11) Enqueue(aTopZoom, 0, 40.f); else if (r == 12) Enqueue(aTopZoom, 0, 60.f);
+    }
+
+    if (!run) ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "%s", Tr("Start playing to edit these values"));
     ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "%s", Tr("Weather and time cheats are in the Cheats tab."));
+    ImGui::Dummy(ImVec2(1.f, 90.f * sc));
 }
 
 static void PageCheats() {
@@ -688,6 +897,26 @@ static void PageMenu() {
     }
     ImGui::Spacing();
 
+    ImGui::TextColored(hdr, "%s", Tr("Overlay"));
+    if (ToggleRow(Tr("Show FPS"), 50, g_ovFps))          { g_ovFps = !g_ovFps; g_saveReq = true; }
+    if (ToggleRow(Tr("Show coordinates"), 51, g_ovCoords)) { g_ovCoords = !g_ovCoords; g_saveReq = true; }
+    if (ToggleRow(Tr("Show playtime"), 52, g_ovPlay))    { g_ovPlay = !g_ovPlay; g_saveReq = true; }
+    if (ToggleRow(Tr("No background"), 53, g_ovNoBg))    { g_ovNoBg = !g_ovNoBg; g_saveReq = true; }
+    if (ToggleRow(Tr("RGB cycle text"), 54, g_ovRgb))    { g_ovRgb = !g_ovRgb; g_saveReq = true; }
+    ImGui::TextColored(dim, "%s", Tr("Position"));
+    {
+        const char* pn[5] = {Tr("Top left"), Tr("Top center"), Tr("Top right"), Tr("Bottom left"), Tr("Bottom right")};
+        int k = ChipRow(pn, 3, 60, g_ovPos, true);        if (k >= 0) { g_ovPos = k; g_saveReq = true; }
+        k = ChipRow(pn + 3, 2, 63, g_ovPos - 3, true);    if (k >= 0) { g_ovPos = 3 + k; g_saveReq = true; }
+    }
+    ImGui::TextColored(dim, "%s", Tr("Text color"));
+    {
+        const char* cn[6] = {Tr("White"), Tr("Yellow"), Tr("Green"), Tr("Cyan"), Tr("Pink"), Tr("Orange")};
+        int k = ChipRow(cn, 3, 66, g_ovColor, !g_ovRgb);        if (k >= 0) { g_ovColor = k; g_saveReq = true; }
+        k = ChipRow(cn + 3, 3, 69, g_ovColor - 3, !g_ovRgb);    if (k >= 0) { g_ovColor = 3 + k; g_saveReq = true; }
+    }
+    ImGui::Spacing();
+
     ImGui::TextColored(hdr, "%s", Tr("Floating button"));
     ImGui::Text(Tr("Opacity: %d%%"), (int)(g_btnAlpha * 100.f + 0.5f));
     if (Btn("-", ImVec2(sq, sq), 30, kBtnCol)) { g_btnAlpha = Clamp(g_btnAlpha - 0.10f, 0.15f, 1.f); g_saveReq = true; }
@@ -703,8 +932,8 @@ static void PageMenu() {
     ImGui::Spacing();
 
     ImGui::TextColored(hdr, "%s", Tr("About"));
-    ImGui::TextColored(dim, "ProMenu 0.5");
-    ImGui::TextColored(dim, Tr("Game state: %d    Game symbols: %d/9"), g_dbgGameState, g_dbgFound);
+    ImGui::TextColored(dim, "ProMenu 0.6");
+    ImGui::TextColored(dim, Tr("Game state: %d    Game symbols: %d/%d"), g_dbgGameState, g_dbgFound, kNumSyms);
     ImGui::TextColored(dim, Tr("Cheat tables: %s"), CheatTablesOk() ? Tr("found") : Tr("missing"));
     ImGui::TextColored(dim, Tr("Touches: %d    Taps: %d"), (int)g_dbgTouches, (int)g_dbgTaps);
     ImGui::TextColored(dim, Tr("Raw events  up: %d  down: %d  move: %d"), (int)g_dbgRaw[1], (int)g_dbgRaw[2], (int)g_dbgRaw[3]);
@@ -736,6 +965,8 @@ static void Draw(float W, float H, float dt) {
     g_rectsBuild.clear();
     g_dbgTaps = g_dbgTaps + g_nFired;
     if (g_armedT > 0.f) { g_armedT -= dt; if (g_armedT <= 0.f) g_armedIdx = -1; }
+    g_fps = g_fps * 0.9f + (1.f / dt) * 0.1f;
+    if (g_canRun) g_playSec += dt;
 
     if (g_finger >= 0 && Now() - g_lastEventT > 5.0) ResetFinger();      // lost UP event: never stay stuck
     if (g_fabTap) { g_fabTap = false; g_open = !g_open; Toast(""); }
@@ -768,6 +999,8 @@ static void Draw(float W, float H, float dt) {
         }
         #undef A
     }
+
+    DrawOverlay(W, H, dt);
 
     // ---- panel --------------------------------------------------------------
     g_openAnim += ((g_open ? 1.f : 0.f) - g_openAnim) * fminf(1.f, dt * 14.f);
