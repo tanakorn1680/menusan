@@ -34,3 +34,13 @@ jobs:
         with:
           name: libProMenu64
           path: libs/arm64-v8a/libProMenu64.so
+
+      # The unstripped copy: with it a crash offset such as "libProMenu64.so + 0x2b69c" in the
+      # game's crash log can be turned into a function name and line number:
+      #   llvm-addr2line -f -C -i -e libProMenu64.so 0x2b69c
+      # (llvm-addr2line is in the NDK: toolchains/llvm/prebuilt/*/bin/)
+      - name: Upload symbols
+        uses: actions/upload-artifact@v4
+        with:
+          name: libProMenu64-symbols
+          path: obj/local/arm64-v8a/libProMenu64.so

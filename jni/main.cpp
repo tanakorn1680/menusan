@@ -32,7 +32,7 @@ static bool ResolveSym(T& out, const char* name) {
 }
 
 #include "rw_backend.h"
-#include "ui.h"
+#include "ui.h"                                  // also pulls in safemem.h (fault-proof memory reads) and diag.h (breadcrumbs)
 
 // ------------------------------------------------------------------ state
 static bool   g_inited = false, g_failed = false;
@@ -251,4 +251,6 @@ ON_MOD_LOAD()
     HOOKSYM(ShutdownRenderWare,       g_hGame, kShutdown);
     HOOKSYM(ClockUpdate,              g_hGame, kClock);
     logger->Info("loaded, hooks installed");
+    Diag::KeepPreviousSession();                 // the breadcrumbs of a crashed run survive the restart
+    Diag::Crumb("ProMenu 0.8 loaded");
 }

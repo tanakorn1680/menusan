@@ -13,8 +13,13 @@
 #include <time.h>
 #include <vector>
 #include "imgui.h"
+#include "safemem.h"
+#include "diag.h"
 
 namespace UI {
+
+static void Toast(const char* text);                 // defined further down
+static const char* Tr(const char* en);               // defined further down
 
 // ======================================================================= data
 // The 100 cheats of the game, in the game's own index order (index into CCheat::m_aCheatFunctions
@@ -164,57 +169,202 @@ static char* PlayerInfo(char* ped) { return (ped && g_getPlayerInfo) ? (char*)g_
 
 // ============================================================== teleport
 static bool g_tpUnderwater = false;                // Teleport > Teleport underwater
+static int  g_tpPending = 0;                       // a teleport is queued and has not run yet (accessed atomically)
 
-// world position of an entity: the matrix position when it has one, otherwise the placement (as the original does)
-static void EntityPos(char* e, float* out) {
-    char* m = *(char**)(e + 0x18);
-    const float* p = m ? (const float*)(m + 0x30) : (const float*)(e + 0x8);
+static bool Finite(float v) { return v - v == 0.f; }          // false for NaN and +-inf
+static double MonoNow() { timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9; }
+
+// World position of an entity: the matrix position when it has one, otherwise the placement (as the original does).
+// Every read goes through SafeMem, so a wrong offset or a stale pointer returns false instead of killing the game.
+static bool EntityPos(const char* e, float* out) {
+    char hdr[0x20];                                // vtable, placement (+0x8), matrix pointer (+0x18)
+    if (!SafeMem::Read(e, hdr, sizeof(hdr))) return false;
+    const char* m = nullptr;
+    memcpy(&m, hdr + 0x18, sizeof(m));
+    float p[3];
+    if (m) { if (!SafeMem::Read(m + 0x30, p, sizeof(p))) return false; }
+    else   { memcpy(p, hdr + 0x8, sizeof(p)); }
+    if (!Finite(p[0]) || !Finite(p[1]) || !Finite(p[2])) return false;
     out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+    return true;
 }
 // the player (or the vehicle they are in)
 static bool PlayerPos(float* out) {
     char* ped = PlayerPed();
     if (!ped) return false;
     char* veh = g_findPlayerVehicle ? (char*)g_findPlayerVehicle(-1, true) : nullptr;
-    EntityPos(veh ? veh : ped, out);
-    return true;
+    if (veh && EntityPos(veh, out)) return true;
+    return EntityPos(ped, out);
 }
-// the map waypoint (radar blip sprite 41), if one is set
-static bool GetWaypoint(float* x, float* y) {
-    if (!g_pRadarTrace || !*g_pRadarTrace) return false;
-    const char* base = *g_pRadarTrace;
-    for (int i = 0; i < 250; i++) {
-        const char* e = base + (size_t)i * 0x30;
-        if (*(const unsigned char*)(e + 0x28) == 0x29) { *x = *(const float*)(e + 0x8); *y = *(const float*)(e + 0xC); return true; }
+
+// ---- the map waypoint (radar blip sprite 41) -------------------------------------------------
+// CRadar::ms_RadarTrace is read as an array of 250 blips of 0x30 bytes.  The first version of this
+// code trusted that the symbol holds a POINTER to that array and dereferenced it blindly; if the
+// game build lays it out differently the game dies the moment the Teleport tab is drawn.  Now the
+// pointer and the table are checked first, and both layouts (pointer / array in place) are handled.
+static const size_t kTraceStride = 0x30;
+static const int kTraceCount = 250, kTraceChunk = 25;
+static const unsigned char kWaypointSprite = 41;
+static const char* g_radarLayout = "not read yet";                 // shown in Menu > About
+
+// copies as many whole chunks of the table as are readable; returns the number of blips copied
+static int ReadTrace(const void* base, unsigned char* buf) {
+    int n = 0;
+    while (n < kTraceCount) {
+        if (!SafeMem::Read((const char*)base + (size_t)n * kTraceStride, buf + (size_t)n * kTraceStride, (size_t)kTraceChunk * kTraceStride)) break;
+        n += kTraceChunk;
+    }
+    return n;
+}
+
+static bool FindWaypointIn(const unsigned char* buf, int count, float* x, float* y) {
+    for (int i = 0; i < count; i++) {
+        const unsigned char* e = buf + (size_t)i * kTraceStride;
+        if (e[0x28] != kWaypointSprite) continue;
+        float px, py;
+        memcpy(&px, e + 0x8, 4); memcpy(&py, e + 0xC, 4);
+        if (!Finite(px) || !Finite(py) || fabsf(px) > 6000.f || fabsf(py) > 6000.f) continue;
+        *x = px; *y = py;
+        return true;
     }
     return false;
 }
 
-// same steps as the original menu: load the area, find the ground (or water surface), teleport, settle on the road
+static bool ReadWaypoint(float* x, float* y) {
+    static unsigned char buf[kTraceStride * kTraceCount];
+    if (!g_pRadarTrace) { g_radarLayout = "symbol missing"; return false; }
+    char* table = nullptr;
+    if (!SafeMem::Get(g_pRadarTrace, 0, table)) { g_radarLayout = "unreadable"; return false; }
+    int n = 0;
+    if (table && (n = ReadTrace(table, buf)) > 0) {                // symbol holds a pointer to the array
+        g_radarLayout = "pointer";
+        return FindWaypointIn(buf, n, x, y);
+    }
+    if (!table) { g_radarLayout = "pointer (empty)"; return false; }   // not allocated yet
+    if ((n = ReadTrace(g_pRadarTrace, buf)) > 0) {                 // the value is no pointer: the symbol IS the array
+        g_radarLayout = "inline";
+        return FindWaypointIn(buf, n, x, y);
+    }
+    g_radarLayout = "unreadable";
+    return false;
+}
+
+// polled at 4 Hz, not every frame: the table is only a few KB but there is no reason to copy it 60 times a second
+static bool GetWaypoint(float* x, float* y) {
+    static double next = 0.0;
+    static bool has = false;
+    static float wx = 0.f, wy = 0.f;
+    static const char* logged = nullptr;
+    const double t = MonoNow();
+    if (t >= next) {
+        next = t + 0.25;
+        has = ReadWaypoint(&wx, &wy);
+        if (logged != g_radarLayout) { logged = g_radarLayout; Diag::Crumb("radar table layout: %s", g_radarLayout); }
+    }
+    if (has) { *x = wx; *y = wy; }
+    return has;
+}
+
+// ---- calling the game's Teleport ----------------------------------------------------------------
+typedef void (*TeleFn)(void*, Vec3*, unsigned char);
+typedef void (*TeleFnAbi)(void*, Vec3*, unsigned char, float, float, float);
+
+// The original menu passes CVector by pointer (x1 = &pos).  The three floats are also placed in s0..s2 and the
+// pointer is 256-byte aligned (so its low byte, which a callee taking the vector in registers would read as the
+// "reset rotation" flag, is 0): the call is then correct under either calling convention.
+static void CallTeleport(TeleFn fn, void* self, const Vec3& p) {
+    alignas(256) static Vec3 s_pos;
+    s_pos = p;
+    reinterpret_cast<TeleFnAbi>(fn)(self, &s_pos, 0, p.x, p.y, p.z);
+}
+
+// Teleport is virtual.  Whichever vtable slot of the player ped holds CPed::Teleport is the slot every entity
+// (cars, bikes, boats...) uses, so the vehicle's OWN override can be looked up instead of guessed from a type field.
+static int g_tpSlot = -2;                          // -2 = not looked up yet, -1 = not found
+static int TeleportSlot(char* ped) {
+    if (g_tpSlot != -2) return g_tpSlot;
+    g_tpSlot = -1;
+    void** vt = nullptr;
+    void* tab[32];
+    if (g_pedTeleport && SafeMem::Get(ped, 0, vt) && vt && SafeMem::Read(vt, tab, sizeof(tab)))
+        for (int i = 0; i < 32; i++) if (tab[i] == (void*)g_pedTeleport) { g_tpSlot = i; break; }
+    Diag::Crumb("teleport vtable slot: %d", g_tpSlot);
+    return g_tpSlot;
+}
+static void* VehicleTeleportFn(char* veh, char* ped) {
+    const int slot = TeleportSlot(ped);
+    if (slot < 0) return nullptr;
+    void** vt = nullptr;
+    void* fn = nullptr;
+    if (!SafeMem::Get(veh, 0, vt) || !vt || !SafeMem::Get(vt, (size_t)slot * sizeof(void*), fn)) return nullptr;
+    return fn;
+}
+
+// Same steps as the original menu: load the area, find the ground (or water surface), teleport, settle on the road.
+// Each step leaves a breadcrumb (Diag::Crumb) so a crash can be pinned to the exact call.
 static void DoTeleport(float x, float y) {
-    char* ped = PlayerPed();
-    if (!ped || !g_pedTeleport) return;
-    if (g_pedAlive && !g_pedAlive(ped)) return;
-    char* veh = g_findPlayerVehicle ? (char*)g_findPlayerVehicle(-1, true) : nullptr;
-    Vec3 pos = {x, y, 1.f};
-    if (g_loadSceneCol) g_loadSceneCol(&pos);
-    if (g_loadScene) g_loadScene(&pos);
-    if (g_loadModels) g_loadModels(false);
-    float z = (g_groundZ ? g_groundZ(x, y) : 0.f) + 1.f;
-    if (!g_tpUnderwater && g_waterNoWaves) {
-        float lvl = 0.f;
-        if (g_waterNoWaves(x, y, 0.f, &lvl, nullptr, nullptr) && lvl >= z) z = lvl;      // stand on the water surface
-    }
-    pos.z = z;
-    if (veh) {
-        const int type = *(int*)(veh + 0x734), cls = *(int*)(veh + 0x738);
-        const bool aircraft = (cls == 3 || cls == 4);
-        if (aircraft) { float cur[3]; EntityPos(veh, cur); if (cur[2] > pos.z) pos.z = cur[2]; }   // keep altitude
-        if (type == 9) { if (g_bikeTeleport) g_bikeTeleport(veh, &pos, 0); if (g_bikePlace) g_bikePlace(veh); }
-        else { if (g_autoTeleport) g_autoTeleport(veh, &pos, 0); if (!aircraft && g_autoPlace) g_autoPlace(veh); }
-    } else {
-        g_pedTeleport(ped, &pos, 0);
-    }
+    static bool busy = false;                      // the streaming calls below must never re-enter this
+    if (busy) return;
+    busy = true;
+
+    do {
+        if (!Finite(x) || !Finite(y) || fabsf(x) > 3500.f || fabsf(y) > 3500.f) { Diag::Crumb("teleport refused: bad coordinates"); break; }
+        char* ped = PlayerPed();
+        if (!ped || !g_pedTeleport) break;
+        if (g_pedAlive && !g_pedAlive(ped)) break;
+        char* veh = g_findPlayerVehicle ? (char*)g_findPlayerVehicle(-1, true) : nullptr;
+
+        // work out what to move BEFORE touching the world, so an unsupported vehicle changes nothing
+        TeleFn tele = g_pedTeleport;
+        void* self = ped;
+        bool bike = false, aircraft = false;
+        if (veh) {
+            int cls = 0;
+            SafeMem::Get(veh, 0x738, cls);
+            aircraft = (cls == 3 || cls == 4);
+            void* vfn = VehicleTeleportFn(veh, ped);
+            tele = nullptr;
+            if (vfn && vfn == (void*)g_bikeTeleport) { tele = g_bikeTeleport; bike = true; }
+            else if (vfn && vfn == (void*)g_autoTeleport) tele = g_autoTeleport;
+            else if (!vfn) {                       // vtable lookup unavailable: fall back to the vehicle type field
+                int type = -1;
+                SafeMem::Get(veh, 0x734, type);
+                if (type == 9 || type == 10) { tele = g_bikeTeleport; bike = true; }
+                else if (type == 0 || type == 1 || type == 2 || type == 3 || type == 4 || type == 7 || type == 8 || type == 11) tele = g_autoTeleport;
+            }
+            if (!tele) { Diag::Crumb("teleport refused: unsupported vehicle"); Toast(Tr("Can't teleport in this vehicle")); break; }
+            self = veh;
+        }
+
+        Vec3 pos = {x, y, 1.f};
+        Diag::Crumb("teleport to %.1f %.1f (%s)", x, y, veh ? (bike ? "bike" : "vehicle") : "on foot");
+        Diag::Crumb("  1 load scene collision");
+        if (g_loadSceneCol) g_loadSceneCol(&pos);
+        Diag::Crumb("  2 load scene");
+        if (g_loadScene) g_loadScene(&pos);
+        Diag::Crumb("  3 load requested models");
+        if (g_loadModels) g_loadModels(false);
+        Diag::Crumb("  4 ground height");
+        float z = (g_groundZ ? g_groundZ(x, y) : 0.f) + 1.f;
+        if (!g_tpUnderwater && g_waterNoWaves) {
+            float lvl = 0.f, f1 = 0.f, f2 = 0.f;   // real out-pointers: the game may write to all three
+            if (g_waterNoWaves(x, y, 0.f, &lvl, &f1, &f2) && lvl >= z) z = lvl;      // stand on the water surface
+        }
+        if (!Finite(z)) { Diag::Crumb("teleport aborted: no ground height"); break; }
+        pos.z = z;
+        if (aircraft) { float cur[3]; if (EntityPos(veh, cur) && cur[2] > pos.z) pos.z = cur[2]; }   // keep altitude
+
+        Diag::Crumb("  5 move to z=%.1f", pos.z);
+        CallTeleport(tele, self, pos);
+        if (veh) {
+            Diag::Crumb("  6 place on road");
+            if (bike) { if (g_bikePlace) g_bikePlace(veh); }
+            else if (!aircraft && g_autoPlace) g_autoPlace(veh);
+        }
+        Diag::Crumb("  done");
+    } while (0);
+
+    busy = false;
 }
 
 // ============================================================ action queue
@@ -223,13 +373,17 @@ enum { aCheat = 0, aVehicle, aClock, aWanted, aHealth, aArmour, aMoney, aTimeSca
 struct Act { int kind; int i; float f; float g; };
 static const int kQueueSize = 32;
 static Act g_queue[kQueueSize];
-static volatile int g_qHead = 0, g_qTail = 0;
+// Single producer (UI) / single consumer (game tick).  The index updates are release/acquire so the consumer can
+// never see the new tail before the slot's contents (a plain volatile does not order the writes on ARM).
+static int g_qHead = 0, g_qTail = 0;
 
-static void Enqueue(int kind, int i, float f = 0.f, float g = 0.f) {
-    int next = (g_qTail + 1) % kQueueSize;
-    if (next == g_qHead) return;
-    g_queue[g_qTail].kind = kind; g_queue[g_qTail].i = i; g_queue[g_qTail].f = f; g_queue[g_qTail].g = g;
-    g_qTail = next;
+static bool Enqueue(int kind, int i, float f = 0.f, float g = 0.f) {
+    const int tail = __atomic_load_n(&g_qTail, __ATOMIC_RELAXED);
+    const int next = (tail + 1) % kQueueSize;
+    if (next == __atomic_load_n(&g_qHead, __ATOMIC_ACQUIRE)) return false;       // full
+    g_queue[tail].kind = kind; g_queue[tail].i = i; g_queue[tail].f = f; g_queue[tail].g = g;
+    __atomic_store_n(&g_qTail, next, __ATOMIC_RELEASE);
+    return true;
 }
 
 static bool g_syncTime = false;                    // Game > Sync to system time
@@ -248,10 +402,15 @@ static void SyncTick(bool running) {
 
 static void RunQueued(bool gameIsRunning) {
     SyncTick(gameIsRunning);
-    while (g_qHead != g_qTail) {
-        const Act a = g_queue[g_qHead];
-        g_qHead = (g_qHead + 1) % kQueueSize;
-        if (!gameIsRunning) continue;
+    for (;;) {
+        const int head = __atomic_load_n(&g_qHead, __ATOMIC_RELAXED);
+        if (head == __atomic_load_n(&g_qTail, __ATOMIC_ACQUIRE)) break;
+        const Act a = g_queue[head];
+        __atomic_store_n(&g_qHead, (head + 1) % kQueueSize, __ATOMIC_RELEASE);
+        if (!gameIsRunning) {
+            if (a.kind == aTeleport) __atomic_store_n(&g_tpPending, 0, __ATOMIC_RELEASE);
+            continue;
+        }
         switch (a.kind) {
             case aCheat:   if (a.i >= 0 && a.i < kNumCheats) ExecCheat(a.i); break;
             case aVehicle: if (g_vehicleCheat) g_vehicleCheat(a.i); break;
@@ -291,7 +450,10 @@ static void RunQueued(bool gameIsRunning) {
                 break;
             case aTopDown: if (g_pTopEnable) *g_pTopEnable = (a.i != 0); break;
             case aTopZoom: if (g_pTopZoom) *g_pTopZoom = (int)Clamp(a.f, 20.f, 60.f); break;
-            case aTeleport: DoTeleport(a.f, a.g); break;
+            case aTeleport:
+                DoTeleport(a.f, a.g);
+                __atomic_store_n(&g_tpPending, 0, __ATOMIC_RELEASE);
+                break;
         }
     }
 }
@@ -535,6 +697,7 @@ static const TrPair kTr[] = {
     {"Teleport", "วาร์ป"}, {"Waypoint", "จุดหมายบนแผนที่"}, {"Waypoint set", "ปักจุดหมายแล้ว"},
     {"No waypoint on the map", "ยังไม่ได้ปักจุดหมายบนแผนที่"}, {"Teleport to waypoint", "วาร์ปไปจุดหมาย"},
     {"Teleport underwater", "วาร์ปลงใต้น้ำ"}, {"Teleporting...", "กำลังวาร์ป..."},
+    {"Can't teleport in this vehicle", "วาร์ปในยานพาหนะนี้ไม่ได้ (ลงจากรถก่อน)"},
     {"Coordinates", "พิกัด"}, {"Use current position", "ใช้ตำแหน่งปัจจุบัน"}, {"Places", "สถานที่"},
     {"My spots", "จุดของฉัน"}, {"Empty", "ว่าง"}, {"Save here", "บันทึกตรงนี้"},
     {"Grove Street", "ถนนโกรฟ"}, {"Los Santos Airport", "สนามบินลอสซานโตส"}, {"Santa Maria Beach", "หาดซานตามาเรีย"},
@@ -822,8 +985,8 @@ static void PagePlayer() {
     ImGui::Spacing();
 
     float hp = 0.f, mx = 100.f, ar = 0.f; int money = 0;
-    if (ped) { hp = *(float*)(ped + kOffHealth); mx = *(float*)(ped + kOffMaxHealth); ar = *(float*)(ped + kOffArmour); }
-    if (info) money = *(int*)(info + kOffMoney);
+    if (ped) { SafeMem::Get(ped, kOffHealth, hp); SafeMem::Get(ped, kOffMaxHealth, mx); SafeMem::Get(ped, kOffArmour, ar); }
+    if (info) SafeMem::Get(info, kOffMoney, money);
     if (mx < 100.f) mx = 100.f;
     char v[48];
 
@@ -993,7 +1156,9 @@ static const int kNumPlaces = (int)(sizeof(kPlaces) / sizeof(kPlaces[0]));
 
 static void TeleportTo(float x, float y, const char* what) {
     if (!g_canRun) { Toast(Tr("Start playing first")); return; }
-    Enqueue(aTeleport, 0, x, y);
+    if (__atomic_exchange_n(&g_tpPending, 1, __ATOMIC_ACQ_REL)) return;     // one at a time: extra taps while loading are ignored
+    Diag::Crumb("tap: teleport %.1f %.1f", x, y);
+    if (!Enqueue(aTeleport, 0, x, y)) { __atomic_store_n(&g_tpPending, 0, __ATOMIC_RELEASE); return; }
     Toast(what);
 }
 
@@ -1135,7 +1300,8 @@ static void PageMenu() {
     ImGui::Spacing();
 
     ImGui::TextColored(hdr, "%s", Tr("About"));
-    ImGui::TextColored(dim, "ProMenu 0.6");
+    ImGui::TextColored(dim, "ProMenu 0.8");
+    ImGui::TextColored(dim, "Radar table: %s", g_radarLayout);
     ImGui::TextColored(dim, Tr("Game state: %d    Game symbols: %d/%d"), g_dbgGameState, g_dbgFound, g_symTotal);
     ImGui::TextColored(dim, Tr("Cheat tables: %s"), CheatTablesOk() ? Tr("found") : Tr("missing"));
     ImGui::TextColored(dim, Tr("Touches: %d    Taps: %d"), (int)g_dbgTouches, (int)g_dbgTaps);
@@ -1272,7 +1438,7 @@ static void Draw(float W, float H, float dt) {
     {
         const ImVec2 wp = ImGui::GetWindowPos(), ws = ImGui::GetWindowSize();
         g_cX0 = wp.x; g_cY0 = wp.y; g_cX1 = wp.x + ws.x; g_cY1 = wp.y + ws.y;
-        if (g_tab != g_lastTab) { ImGui::SetScrollY(0.f); g_lastTab = g_tab; g_fling = 0.f; }
+        if (g_tab != g_lastTab) { ImGui::SetScrollY(0.f); g_lastTab = g_tab; g_fling = 0.f; Diag::Crumb("tab: %s", kTabs[g_tab]); }
         else if (scrollDy != 0.f) { ImGui::SetScrollY(ImGui::GetScrollY() - scrollDy); g_fling = 0.f; }
         else if (g_finger >= 0 && g_scrollArea) g_fling = 0.f;
         else if (fabsf(g_fling) > 40.f) { ImGui::SetScrollY(ImGui::GetScrollY() - g_fling * dt); g_fling = g_fling * expf(-dt * 3.5f); }

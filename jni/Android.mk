@@ -21,7 +21,8 @@ LOCAL_SRC_FILES  += logger_fallback.cpp
 endif
 
 LOCAL_C_INCLUDES := $(LOCAL_PATH) $(LOCAL_PATH)/imgui $(LOCAL_PATH)/include $(AML_EXTRA_INC)
-LOCAL_CPPFLAGS   := -O2 -fno-strict-aliasing
+# -g only adds debug info to the UNSTRIPPED copy (obj/local/...), the .so that goes into the game stays the same size
+LOCAL_CPPFLAGS   := -O2 -g -fno-strict-aliasing
 # bind our own ImGui symbols locally so we never collide with another mod's ImGui copy
 LOCAL_LDFLAGS    := -Wl,-Bsymbolic
 LOCAL_LDLIBS     := -llog -ldl
