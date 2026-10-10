@@ -49,8 +49,8 @@ static const Veh kVeh[] = {
 };
 static const int kNumVeh = (int)(sizeof(kVeh) / sizeof(kVeh[0]));
 
-enum { kTabPlayer = 0, kTabVehicle, kTabTeleport, kTabGame, kTabCheats, kTabMenu, kTabCount };
-static const char* kTabs[] = {"Player", "Vehicle", "Teleport", "Game", "Cheats", "Menu"};
+enum { kTabPlayer = 0, kTabVehicle, kTabTeleport, kTabGame, kTabCheats, kTabLog, kTabMenu, kTabCount };
+static const char* kTabs[] = {"Player", "Vehicle", "Teleport", "Game", "Cheats", "Log", "Menu"};
 
 // ============================================================== game access
 typedef void (*CheatFn)();
@@ -1250,6 +1250,77 @@ static void PageCheats() {
     ImGui::Dummy(ImVec2(1.f, 90.f * sc));
 }
 
+// ======================================================================= Log tab
+// Read-only viewer for MCBridge's own log files (MCBridge writes them, this just displays them).
+// Same app / same process via AML, so the files are reachable here with a plain fopen - no
+// permission or cross-app issue. Nothing here writes to MCBridge's files or touches the bridge.
+static char g_logBuf[3][8192];        // 0 = MCBridge last_action.txt, 1 = MCBridge session.log (tail), 2 = MCBridge previous_session.txt
+static bool g_logLoaded = false;
+
+static void LoadOneLog(const char* dir, const char* file, char* out, size_t cap) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", dir, file);
+    FILE* f = fopen(path, "r");
+    if (!f) { snprintf(out, cap, "(not found: %s)", path); return; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    long want = (long)cap - 1;
+    long start = (sz > want) ? (sz - want) : 0;
+    fseek(f, start, SEEK_SET);
+    size_t n = fread(out, 1, (size_t)(sz - start), f);
+    out[n] = 0;
+    fclose(f);
+}
+
+static void RefreshLogs() {
+    // MCBridge writes under .../files/MCBridge/ (this plugin writes under .../files/ProMenu/, see diag.h) -
+    // both live inside the same GTA SA app data folder, so the same two candidate roots apply.
+    static const char* kMcDirs[2] = {
+        "/storage/emulated/0/Android/data/com.rockstargames.gtasa/files/MCBridge",
+        "/sdcard/Android/data/com.rockstargames.gtasa/files/MCBridge",
+    };
+    const char* dir = nullptr;
+    for (int d = 0; d < 2; d++) {
+        struct stat st;
+        if (stat(kMcDirs[d], &st) == 0 && S_ISDIR(st.st_mode)) { dir = kMcDirs[d]; break; }
+    }
+    if (!dir) {
+        snprintf(g_logBuf[0], sizeof(g_logBuf[0]), "MCBridge folder not found under Android/data/com.rockstargames.gtasa/files/.\nEither MCBridge has not loaded yet, or it failed before it could create it.");
+        g_logBuf[1][0] = 0;
+        g_logBuf[2][0] = 0;
+        g_logLoaded = true;
+        return;
+    }
+    LoadOneLog(dir, "last_action.txt", g_logBuf[0], sizeof(g_logBuf[0]));
+    LoadOneLog(dir, "session.log", g_logBuf[1], sizeof(g_logBuf[1]));
+    LoadOneLog(dir, "previous_session.txt", g_logBuf[2], sizeof(g_logBuf[2]));
+    g_logLoaded = true;
+}
+
+static void LogBlock(const char* title, const char* text, int sectionIdx, int id) {
+    if (Section(title, sectionIdx, id)) {
+        ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + RowWidth());
+        ImGui::TextUnformatted(text[0] ? text : "(empty)");
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+    }
+}
+
+static void PageLog() {
+    const float sc = g_sc, btnH = 96.f * sc;
+    if (!g_logLoaded) RefreshLogs();
+
+    if (Btn("Refresh", ImVec2(RowWidth(), btnH), 870, kAccentCol)) RefreshLogs();
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "MCBridge log files (read-only). This tab does not control MCBridge.");
+    ImGui::Spacing();
+
+    LogBlock("Last steps (last_action.txt)", g_logBuf[0], 40, 871);
+    LogBlock("Full log, tail (session.log)", g_logBuf[1], 41, 872);
+    LogBlock("Previous run (previous_session.txt)", g_logBuf[2], 42, 873);
+    ImGui::Dummy(ImVec2(1.f, 90.f * sc));
+}
+
 static void PageMenu() {
     const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
     const float sq = 88.f * sc, wide = RowWidth(), btnH = 96.f * sc;
@@ -1450,6 +1521,7 @@ static void Draw(float W, float H, float dt) {
         case kTabTeleport: PageTeleport(); break;
         case kTabGame:    PageGame();    break;
         case kTabCheats:  PageCheats();  break;
+        case kTabLog:     PageLog();     break;
         default:          PageMenu();    break;
     }
     ImGui::EndChild();
