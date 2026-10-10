@@ -1272,6 +1272,22 @@ static void LoadOneLog(const char* dir, const char* file, char* out, size_t cap)
     fclose(f);
 }
 
+static char g_copyPath[256] = "";     // where copy_me.txt ended up (empty = not written yet / failed)
+
+// Write all three sections into one plain-text file so it can be opened and shared with any
+// normal file manager / share sheet, without depending on in-app text selection.
+static void WriteCopyFile(const char* dir) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/copy_me.txt", dir);
+    FILE* f = fopen(path, "w");
+    if (!f) { g_copyPath[0] = 0; return; }
+    fprintf(f, "=== Last steps (last_action.txt) ===\n%s\n\n", g_logBuf[0]);
+    fprintf(f, "=== Full log, tail (session.log) ===\n%s\n\n", g_logBuf[1]);
+    fprintf(f, "=== Previous run (previous_session.txt) ===\n%s\n", g_logBuf[2]);
+    fclose(f);
+    snprintf(g_copyPath, sizeof(g_copyPath), "%s", path);
+}
+
 static void RefreshLogs() {
     // MCBridge writes under .../files/MCBridge/ (this plugin writes under .../files/ProMenu/, see diag.h) -
     // both live inside the same GTA SA app data folder, so the same two candidate roots apply.
@@ -1288,12 +1304,14 @@ static void RefreshLogs() {
         snprintf(g_logBuf[0], sizeof(g_logBuf[0]), "MCBridge folder not found under Android/data/com.rockstargames.gtasa/files/.\nEither MCBridge has not loaded yet, or it failed before it could create it.");
         g_logBuf[1][0] = 0;
         g_logBuf[2][0] = 0;
+        g_copyPath[0] = 0;
         g_logLoaded = true;
         return;
     }
     LoadOneLog(dir, "last_action.txt", g_logBuf[0], sizeof(g_logBuf[0]));
     LoadOneLog(dir, "session.log", g_logBuf[1], sizeof(g_logBuf[1]));
     LoadOneLog(dir, "previous_session.txt", g_logBuf[2], sizeof(g_logBuf[2]));
+    WriteCopyFile(dir);
     g_logLoaded = true;
 }
 
@@ -1313,6 +1331,10 @@ static void PageLog() {
     if (Btn("Refresh", ImVec2(RowWidth(), btnH), 870, kAccentCol)) RefreshLogs();
     ImGui::Spacing();
     ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "MCBridge log files (read-only). This tab does not control MCBridge.");
+    if (g_copyPath[0]) {
+        ImGui::TextColored(ImVec4(0.45f, 0.75f, 0.50f, 1), "Saved: %s", g_copyPath);
+        ImGui::TextColored(ImVec4(0.55f, 0.60f, 0.70f, 1), "Open that file with any file manager to share or copy it.");
+    }
     ImGui::Spacing();
 
     LogBlock("Last steps (last_action.txt)", g_logBuf[0], 40, 871);
