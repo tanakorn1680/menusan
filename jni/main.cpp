@@ -160,8 +160,9 @@ static bool InitImGui() {
 
     UI::Init(sc);
     UI::LoadConfig();
+    UI::LoadSpots();
     UI::g_dbgFound = UI::ResolveGame(GameSym);
-    logger->Info("ImGui ready, screen %dx%d, game symbols %d/%d, cheat tables %s", (int)w, (int)h, UI::g_dbgFound, UI::kNumSyms, UI::CheatTablesOk() ? "ok" : "MISSING");
+    logger->Info("ImGui ready, screen %dx%d, game symbols %d/%d, cheat tables %s", (int)w, (int)h, UI::g_dbgFound, UI::g_symTotal, UI::CheatTablesOk() ? "ok" : "MISSING");
     g_lastT = NowSec();
     return true;
 }

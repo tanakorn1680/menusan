@@ -44,8 +44,8 @@ static const Veh kVeh[] = {
 };
 static const int kNumVeh = (int)(sizeof(kVeh) / sizeof(kVeh[0]));
 
-enum { kTabPlayer = 0, kTabVehicle, kTabGame, kTabCheats, kTabMenu, kTabCount };
-static const char* kTabs[] = {"Player", "Vehicle", "Game", "Cheats", "Menu"};
+enum { kTabPlayer = 0, kTabVehicle, kTabTeleport, kTabGame, kTabCheats, kTabMenu, kTabCount };
+static const char* kTabs[] = {"Player", "Vehicle", "Teleport", "Game", "Cheats", "Menu"};
 
 // ============================================================== game access
 typedef void (*CheatFn)();
@@ -61,7 +61,20 @@ static unsigned char* g_pCurrentDay = nullptr;      // CClock::CurrentDay
 static bool* g_pGodFlag = nullptr;                  // CPlayerPed::bDebugPlayerInvincible
 static int g_godIdx = -1;                           // index of INVINCIBILITY in the cheat list
 struct Vec3 { float x, y, z; };
-static Vec3 (*g_getCoors)(int) = nullptr;           // FindPlayerCoors(0)
+// teleport (signatures read from the original menu; CVector is passed by pointer in this ABI)
+static void* (*g_findPlayerVehicle)(int, bool) = nullptr;           // FindPlayerVehicle(-1, true)
+static bool (*g_pedAlive)(void*) = nullptr;                         // CPed::IsAlive
+static void (*g_pedTeleport)(void*, Vec3*, unsigned char) = nullptr;   // CPed::Teleport
+static void (*g_bikeTeleport)(void*, Vec3*, unsigned char) = nullptr;  // CBike::Teleport
+static void (*g_autoTeleport)(void*, Vec3*, unsigned char) = nullptr;  // CAutomobile::Teleport
+static void (*g_bikePlace)(void*) = nullptr;                        // CBike::PlaceOnRoadProperly
+static void (*g_autoPlace)(void*) = nullptr;                        // CAutomobile::PlaceOnRoadProperly
+static float (*g_groundZ)(float, float) = nullptr;                  // CWorld::FindGroundZForCoord
+static void (*g_loadSceneCol)(const Vec3*) = nullptr;               // CStreaming::LoadSceneCollision
+static void (*g_loadScene)(const Vec3*) = nullptr;                  // CStreaming::LoadScene
+static void (*g_loadModels)(bool) = nullptr;                        // CStreaming::LoadAllRequestedModels
+static bool (*g_waterNoWaves)(float, float, float, float*, float*, float*) = nullptr;   // CWaterLevel::GetWaterLevelNoWaves
+static char** g_pRadarTrace = nullptr;                              // CRadar::ms_RadarTrace (pointer to the trace array)
 static float* g_pTimeScale = nullptr;               // CTimer::ms_fTimeScale
 static unsigned char* g_pClockH = nullptr;          // CClock::ms_nGameClockHours
 static unsigned char* g_pClockM = nullptr;          // CClock::ms_nGameClockMinutes
@@ -70,21 +83,23 @@ static void (*g_forceWeather)(short) = nullptr;     // CWeather::ForceWeather
 static void (*g_releaseWeather)() = nullptr;        // CWeather::ReleaseWeather
 static bool* g_pTopEnable = nullptr;                // TopDownCamera::m_bEnable
 static int* g_pTopZoom = nullptr;                   // TopDownCamera::m_nZoom
-static const int kNumSyms = 18;                     // how many game symbols ResolveGame looks for
+static int g_symTotal = 0;                          // how many game symbols ResolveGame looked for
 
 // Field offsets inside the 64-bit game structures (read from the original menu's code)
 static const int kOffHealth = 0x6AC, kOffMaxHealth = 0x6B0, kOffArmour = 0x6B4;   // CPed
 static const int kOffMoney = 0xF0;                                                // CPlayerInfo
 
 template <typename T> static void Res(uintptr_t (*lookup)(const char*), T& out, const char* name, int& found) {
+    g_symTotal++;
     uintptr_t a = lookup(name);
     out = reinterpret_cast<T>(a);
     if (a) found++;
 }
 
-// returns how many of the kNumSyms game symbols were found
+// returns how many of the g_symTotal game symbols were found
 static int ResolveGame(uintptr_t (*lookup)(const char*)) {
     int found = 0;
+    g_symTotal = 0;
     Res(lookup, g_cheatFns, "_ZN6CCheat17m_aCheatFunctionsE", found);
     Res(lookup, g_cheatOn, "_ZN6CCheat15m_aCheatsActiveE", found);
     Res(lookup, g_vehicleCheat, "_ZN6CCheat12VehicleCheatEi", found);
@@ -94,7 +109,19 @@ static int ResolveGame(uintptr_t (*lookup)(const char*)) {
     Res(lookup, g_getPlayerInfo, "_ZN10CPlayerPed29GetPlayerInfoForThisPlayerPedEv", found);
     Res(lookup, g_pCurrentDay, "_ZN6CClock10CurrentDayE", found);
     Res(lookup, g_pGodFlag, "_ZN10CPlayerPed22bDebugPlayerInvincibleE", found);
-    Res(lookup, g_getCoors, "_Z15FindPlayerCoorsi", found);
+    Res(lookup, g_findPlayerVehicle, "_Z17FindPlayerVehicleib", found);
+    Res(lookup, g_pedAlive, "_ZN4CPed7IsAliveEv", found);
+    Res(lookup, g_pedTeleport, "_ZN4CPed8TeleportE7CVectorh", found);
+    Res(lookup, g_bikeTeleport, "_ZN5CBike8TeleportE7CVectorh", found);
+    Res(lookup, g_autoTeleport, "_ZN11CAutomobile8TeleportE7CVectorh", found);
+    Res(lookup, g_bikePlace, "_ZN5CBike19PlaceOnRoadProperlyEv", found);
+    Res(lookup, g_autoPlace, "_ZN11CAutomobile19PlaceOnRoadProperlyEv", found);
+    Res(lookup, g_groundZ, "_ZN6CWorld19FindGroundZForCoordEff", found);
+    Res(lookup, g_loadSceneCol, "_ZN10CStreaming18LoadSceneCollisionEPK7CVector", found);
+    Res(lookup, g_loadScene, "_ZN10CStreaming9LoadSceneEPK7CVector", found);
+    Res(lookup, g_loadModels, "_ZN10CStreaming22LoadAllRequestedModelsEb", found);
+    Res(lookup, g_waterNoWaves, "_ZN11CWaterLevel20GetWaterLevelNoWavesEfffPfS0_S0_", found);
+    Res(lookup, g_pRadarTrace, "_ZN6CRadar13ms_RadarTraceE", found);
     Res(lookup, g_pTimeScale, "_ZN6CTimer13ms_fTimeScaleE", found);
     Res(lookup, g_pClockH, "_ZN6CClock18ms_nGameClockHoursE", found);
     Res(lookup, g_pClockM, "_ZN6CClock20ms_nGameClockMinutesE", found);
@@ -135,18 +162,73 @@ static float Clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ?
 static char* PlayerPed() { return g_findPlayerPed ? (char*)g_findPlayerPed(0) : nullptr; }
 static char* PlayerInfo(char* ped) { return (ped && g_getPlayerInfo) ? (char*)g_getPlayerInfo(ped) : nullptr; }
 
+// ============================================================== teleport
+static bool g_tpUnderwater = false;                // Teleport > Teleport underwater
+
+// world position of an entity: the matrix position when it has one, otherwise the placement (as the original does)
+static void EntityPos(char* e, float* out) {
+    char* m = *(char**)(e + 0x18);
+    const float* p = m ? (const float*)(m + 0x30) : (const float*)(e + 0x8);
+    out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+}
+// the player (or the vehicle they are in)
+static bool PlayerPos(float* out) {
+    char* ped = PlayerPed();
+    if (!ped) return false;
+    char* veh = g_findPlayerVehicle ? (char*)g_findPlayerVehicle(-1, true) : nullptr;
+    EntityPos(veh ? veh : ped, out);
+    return true;
+}
+// the map waypoint (radar blip sprite 41), if one is set
+static bool GetWaypoint(float* x, float* y) {
+    if (!g_pRadarTrace || !*g_pRadarTrace) return false;
+    const char* base = *g_pRadarTrace;
+    for (int i = 0; i < 250; i++) {
+        const char* e = base + (size_t)i * 0x30;
+        if (*(const unsigned char*)(e + 0x28) == 0x29) { *x = *(const float*)(e + 0x8); *y = *(const float*)(e + 0xC); return true; }
+    }
+    return false;
+}
+
+// same steps as the original menu: load the area, find the ground (or water surface), teleport, settle on the road
+static void DoTeleport(float x, float y) {
+    char* ped = PlayerPed();
+    if (!ped || !g_pedTeleport) return;
+    if (g_pedAlive && !g_pedAlive(ped)) return;
+    char* veh = g_findPlayerVehicle ? (char*)g_findPlayerVehicle(-1, true) : nullptr;
+    Vec3 pos = {x, y, 1.f};
+    if (g_loadSceneCol) g_loadSceneCol(&pos);
+    if (g_loadScene) g_loadScene(&pos);
+    if (g_loadModels) g_loadModels(false);
+    float z = (g_groundZ ? g_groundZ(x, y) : 0.f) + 1.f;
+    if (!g_tpUnderwater && g_waterNoWaves) {
+        float lvl = 0.f;
+        if (g_waterNoWaves(x, y, 0.f, &lvl, nullptr, nullptr) && lvl >= z) z = lvl;      // stand on the water surface
+    }
+    pos.z = z;
+    if (veh) {
+        const int type = *(int*)(veh + 0x734), cls = *(int*)(veh + 0x738);
+        const bool aircraft = (cls == 3 || cls == 4);
+        if (aircraft) { float cur[3]; EntityPos(veh, cur); if (cur[2] > pos.z) pos.z = cur[2]; }   // keep altitude
+        if (type == 9) { if (g_bikeTeleport) g_bikeTeleport(veh, &pos, 0); if (g_bikePlace) g_bikePlace(veh); }
+        else { if (g_autoTeleport) g_autoTeleport(veh, &pos, 0); if (!aircraft && g_autoPlace) g_autoPlace(veh); }
+    } else {
+        g_pedTeleport(ped, &pos, 0);
+    }
+}
+
 // ============================================================ action queue
 // The UI never touches the game directly; it queues actions that run inside the game's update tick.
-enum { aCheat = 0, aVehicle, aClock, aWanted, aHealth, aArmour, aMoney, aTimeScale, aClockHM, aDay, aDayLen, aWeather, aTopDown, aTopZoom };
-struct Act { int kind; int i; float f; };
+enum { aCheat = 0, aVehicle, aClock, aWanted, aHealth, aArmour, aMoney, aTimeScale, aClockHM, aDay, aDayLen, aWeather, aTopDown, aTopZoom, aTeleport };
+struct Act { int kind; int i; float f; float g; };
 static const int kQueueSize = 32;
 static Act g_queue[kQueueSize];
 static volatile int g_qHead = 0, g_qTail = 0;
 
-static void Enqueue(int kind, int i, float f = 0.f) {
+static void Enqueue(int kind, int i, float f = 0.f, float g = 0.f) {
     int next = (g_qTail + 1) % kQueueSize;
     if (next == g_qHead) return;
-    g_queue[g_qTail].kind = kind; g_queue[g_qTail].i = i; g_queue[g_qTail].f = f;
+    g_queue[g_qTail].kind = kind; g_queue[g_qTail].i = i; g_queue[g_qTail].f = f; g_queue[g_qTail].g = g;
     g_qTail = next;
 }
 
@@ -209,6 +291,7 @@ static void RunQueued(bool gameIsRunning) {
                 break;
             case aTopDown: if (g_pTopEnable) *g_pTopEnable = (a.i != 0); break;
             case aTopZoom: if (g_pTopZoom) *g_pTopZoom = (int)Clamp(a.f, 20.f, 60.f); break;
+            case aTeleport: DoTeleport(a.f, a.g); break;
         }
     }
 }
@@ -227,6 +310,10 @@ static bool g_fadeIdle = true;
 static bool g_lockPos = false;                    // when on, the floating button cannot be dragged
 static int g_lang = 0;                            // 0 = English, 1 = Thai
 static bool g_thaiOk = false;                     // a Thai font was loaded (set by main.cpp)
+static float g_tpX = 0.f, g_tpY = 0.f;            // Teleport > Coordinates target
+static float g_spot[6][2];                        // Teleport > My spots
+static bool g_spotSet[6];
+static bool g_saveSpots = false;
 // on-screen info overlay (Menu > Overlay)
 static bool g_ovFps = false, g_ovCoords = false, g_ovPlay = false, g_ovNoBg = false, g_ovRgb = false;
 static int g_ovPos = 1, g_ovColor = 0;            // position 0..4 (TL, TC, TR, BL, BR), colour 0..5
@@ -445,6 +532,15 @@ static const TrPair kTr[] = {
     {"Top left", "บนซ้าย"}, {"Top center", "บนกลาง"}, {"Top right", "บนขวา"}, {"Bottom left", "ล่างซ้าย"}, {"Bottom right", "ล่างขวา"},
     {"Text color", "สีตัวอักษร"}, {"White", "ขาว"}, {"Yellow", "เหลือง"}, {"Green", "เขียว"}, {"Cyan", "ฟ้า"}, {"Pink", "ชมพู"}, {"Orange", "ส้ม"},
     {"Playtime", "เวลาเล่น"},
+    {"Teleport", "วาร์ป"}, {"Waypoint", "จุดหมายบนแผนที่"}, {"Waypoint set", "ปักจุดหมายแล้ว"},
+    {"No waypoint on the map", "ยังไม่ได้ปักจุดหมายบนแผนที่"}, {"Teleport to waypoint", "วาร์ปไปจุดหมาย"},
+    {"Teleport underwater", "วาร์ปลงใต้น้ำ"}, {"Teleporting...", "กำลังวาร์ป..."},
+    {"Coordinates", "พิกัด"}, {"Use current position", "ใช้ตำแหน่งปัจจุบัน"}, {"Places", "สถานที่"},
+    {"My spots", "จุดของฉัน"}, {"Empty", "ว่าง"}, {"Save here", "บันทึกตรงนี้"},
+    {"Grove Street", "ถนนโกรฟ"}, {"Los Santos Airport", "สนามบินลอสซานโตส"}, {"Santa Maria Beach", "หาดซานตามาเรีย"},
+    {"Vinewood Sign", "ป้ายวินวูด"}, {"Mount Chiliad", "ภูเขาชิลเลียด"}, {"Angel Pine", "แองเจิลไพน์"},
+    {"Doherty Garage", "อู่โดเฮอร์ตี"}, {"Area 51", "แอเรีย 51"}, {"Four Dragons Casino", "คาสิโนโฟร์ดราก้อนส์"},
+    {"Las Venturas Airport", "สนามบินลาสเวนทูรัส"},
     {"Weather and time cheats are in the Cheats tab.", "สูตรอากาศและเวลาอยู่ในแท็บสูตรโกง"},
     {"Cheat tables not found in this game version.", "ไม่พบตารางสูตรในเกมเวอร์ชันนี้"},
     {"Floating button", "ปุ่มลอย"},
@@ -601,6 +697,35 @@ static int Stepper(const char* title, int idBase, const char* value, const char*
     return r;
 }
 
+static void LoadSpots() {
+    char path[320];
+    for (int d = 0; d < 2; d++) {
+        snprintf(path, sizeof(path), "%s/spots.txt", kCfgDirs[d]);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        for (int i = 0; i < 6; i++) {
+            int set; float x, y;
+            if (fscanf(f, "%d %f %f", &set, &x, &y) != 3) break;
+            g_spotSet[i] = set != 0; g_spot[i][0] = x; g_spot[i][1] = y;
+        }
+        fclose(f);
+        return;
+    }
+}
+
+static void SaveSpots() {
+    char path[320];
+    for (int d = 0; d < 2; d++) {
+        mkdir(kCfgDirs[d], 0777);
+        snprintf(path, sizeof(path), "%s/spots.txt", kCfgDirs[d]);
+        FILE* f = fopen(path, "w");
+        if (!f) continue;
+        for (int i = 0; i < 6; i++) fprintf(f, "%d %.2f %.2f\n", g_spotSet[i] ? 1 : 0, g_spot[i][0], g_spot[i][1]);
+        fclose(f);
+        return;
+    }
+}
+
 static void Init(float scale) {
     g_sc = scale;
     g_slop = fmaxf(40.f, 48.f * scale);
@@ -619,6 +744,7 @@ static void Init(float scale) {
     g_expanded[0] = true;        // first cheat group
     g_expanded[20] = true;       // first vehicle section
     g_expanded[30] = g_expanded[31] = g_expanded[32] = true;   // Game: switches, speed, time
+    g_expanded[36] = g_expanded[37] = true;                    // Teleport: waypoint, coordinates
 }
 
 // ===================================================================== overlay
@@ -644,7 +770,8 @@ static void DrawOverlay(float W, float H, float dt) {
     char lines[3][96]; int n = 0;
     if (g_ovFps) snprintf(lines[n++], sizeof(lines[0]), "FPS: %d", (int)(g_fps + 0.5f));
     if (g_ovCoords) {
-        if (g_canRun && g_getCoors) { const Vec3 c = g_getCoors(0); snprintf(lines[n++], sizeof(lines[0]), "X: %.1f  Y: %.1f  Z: %.1f", c.x, c.y, c.z); }
+        float p[3];
+        if (g_canRun && PlayerPos(p)) snprintf(lines[n++], sizeof(lines[0]), "X: %.1f  Y: %.1f  Z: %.1f", p[0], p[1], p[2]);
         else snprintf(lines[n++], sizeof(lines[0]), "X: -  Y: -  Z: -");
     }
     if (g_ovPlay) {
@@ -855,6 +982,82 @@ static void PageGame() {
     ImGui::Dummy(ImVec2(1.f, 90.f * sc));
 }
 
+struct Place { const char* name; float x, y; };
+static const Place kPlaces[] = {                  // approximate; the ground height is looked up on arrival
+    {"Grove Street", 2495.f, -1688.f}, {"Los Santos Airport", 1642.f, -2335.f}, {"Santa Maria Beach", 368.f, -2036.f},
+    {"Vinewood Sign", 1413.f, -810.f}, {"Mount Chiliad", -2321.f, -1613.f}, {"Angel Pine", -2150.f, -2400.f},
+    {"Doherty Garage", -2026.f, 154.f}, {"Area 51", 213.f, 1922.f}, {"Four Dragons Casino", 2020.f, 1010.f},
+    {"Las Venturas Airport", 1685.f, 1450.f},
+};
+static const int kNumPlaces = (int)(sizeof(kPlaces) / sizeof(kPlaces[0]));
+
+static void TeleportTo(float x, float y, const char* what) {
+    if (!g_canRun) { Toast(Tr("Start playing first")); return; }
+    Enqueue(aTeleport, 0, x, y);
+    Toast(what);
+}
+
+static void PageTeleport() {
+    const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
+    const ImVec4 dim(0.55f, 0.60f, 0.70f, 1);
+    const bool run = g_canRun && g_pedTeleport != nullptr;
+    char v[96];
+
+    if (Section(Tr("Waypoint"), 36, 370)) {
+        float wx = 0.f, wy = 0.f;
+        const bool has = g_canRun && GetWaypoint(&wx, &wy);
+        if (has) snprintf(v, sizeof(v), "%s: %d, %d", Tr("Waypoint set"), (int)wx, (int)wy);
+        else     snprintf(v, sizeof(v), "%s", Tr("No waypoint on the map"));
+        ImGui::TextColored(dim, "%s", v);
+        if (Btn(Tr("Teleport to waypoint"), ImVec2(RowWidth(), 100.f * sc), 800, kAccentCol, run && has)) TeleportTo(wx, wy, Tr("Teleporting..."));
+        if (ToggleRow(Tr("Teleport underwater"), 801, g_tpUnderwater)) g_tpUnderwater = !g_tpUnderwater;
+        ImGui::Spacing();
+    }
+
+    if (Section(Tr("Coordinates"), 37, 371)) {
+        snprintf(v, sizeof(v), "%d", (int)g_tpX);
+        int r = Stepper("X", 820, v, "10", "100", nullptr, 0, true);
+        if (r == -2) g_tpX -= 100.f; else if (r == -1) g_tpX -= 10.f; else if (r == 1) g_tpX += 10.f; else if (r == 2) g_tpX += 100.f;
+        snprintf(v, sizeof(v), "%d", (int)g_tpY);
+        r = Stepper("Y", 850, v, "10", "100", nullptr, 0, true);
+        if (r == -2) g_tpY -= 100.f; else if (r == -1) g_tpY -= 10.f; else if (r == 1) g_tpY += 10.f; else if (r == 2) g_tpY += 100.f;
+        g_tpX = Clamp(g_tpX, -3000.f, 3000.f); g_tpY = Clamp(g_tpY, -3000.f, 3000.f);
+        const float hw = (RowWidth() - sp) * 0.5f;
+        if (Btn(Tr("Use current position"), ImVec2(hw, 96.f * sc), 860, kBtnCol, g_canRun)) {
+            float p[3]; if (PlayerPos(p)) { g_tpX = p[0]; g_tpY = p[1]; }
+        }
+        ImGui::SameLine();
+        if (Btn(Tr("Teleport"), ImVec2(hw, 96.f * sc), 861, kAccentCol, run)) TeleportTo(g_tpX, g_tpY, Tr("Teleporting..."));
+        ImGui::Spacing();
+    }
+
+    if (Section(Tr("Places"), 38, 372)) {
+        const float colW = (RowWidth() - sp) * 0.5f;
+        for (int i = 0; i < kNumPlaces; i++) {
+            if (i % 2) ImGui::SameLine();
+            if (Btn(Tr(kPlaces[i].name), ImVec2(colW, 96.f * sc), 900 + i, kBtnCol, run)) TeleportTo(kPlaces[i].x, kPlaces[i].y, Tr(kPlaces[i].name));
+        }
+        ImGui::Spacing();
+    }
+
+    if (Section(Tr("My spots"), 39, 373)) {
+        const float goW = RowWidth() * 0.62f - sp, saveW = RowWidth() - goW - sp;
+        for (int i = 0; i < 6; i++) {
+            if (g_spotSet[i]) snprintf(v, sizeof(v), "%d:  %d, %d", i + 1, (int)g_spot[i][0], (int)g_spot[i][1]);
+            else              snprintf(v, sizeof(v), "%d:  %s", i + 1, Tr("Empty"));
+            if (Btn(v, ImVec2(goW, 96.f * sc), 950 + i, kBtnCol, run && g_spotSet[i])) TeleportTo(g_spot[i][0], g_spot[i][1], Tr("Teleporting..."));
+            ImGui::SameLine();
+            if (Btn(Tr("Save here"), ImVec2(saveW, 96.f * sc), 960 + i, kBtnCol, g_canRun)) {
+                float p[3];
+                if (PlayerPos(p)) { g_spot[i][0] = p[0]; g_spot[i][1] = p[1]; g_spotSet[i] = true; g_saveSpots = true; Toast(Tr("Save here")); }
+            }
+        }
+    }
+
+    if (!g_canRun) ImGui::TextColored(dim, "%s", Tr("Start playing to edit these values"));
+    ImGui::Dummy(ImVec2(1.f, 90.f * sc));
+}
+
 static void PageCheats() {
     const float sc = g_sc, sp = ImGui::GetStyle().ItemSpacing.x;
     if (!CheatTablesOk()) {
@@ -933,7 +1136,7 @@ static void PageMenu() {
 
     ImGui::TextColored(hdr, "%s", Tr("About"));
     ImGui::TextColored(dim, "ProMenu 0.6");
-    ImGui::TextColored(dim, Tr("Game state: %d    Game symbols: %d/%d"), g_dbgGameState, g_dbgFound, kNumSyms);
+    ImGui::TextColored(dim, Tr("Game state: %d    Game symbols: %d/%d"), g_dbgGameState, g_dbgFound, g_symTotal);
     ImGui::TextColored(dim, Tr("Cheat tables: %s"), CheatTablesOk() ? Tr("found") : Tr("missing"));
     ImGui::TextColored(dim, Tr("Touches: %d    Taps: %d"), (int)g_dbgTouches, (int)g_dbgTaps);
     ImGui::TextColored(dim, Tr("Raw events  up: %d  down: %d  move: %d"), (int)g_dbgRaw[1], (int)g_dbgRaw[2], (int)g_dbgRaw[3]);
@@ -971,6 +1174,7 @@ static void Draw(float W, float H, float dt) {
     if (g_finger >= 0 && Now() - g_lastEventT > 5.0) ResetFinger();      // lost UP event: never stay stuck
     if (g_fabTap) { g_fabTap = false; g_open = !g_open; Toast(""); }
     if (g_saveReq) { g_saveReq = false; SaveConfig(W, H); }
+    if (g_saveSpots) { g_saveSpots = false; SaveSpots(); }
 
     // ---- floating button (always on top, stays exactly where you put it) -----
     if (g_finger >= 0 || g_open) g_idle = 0.f; else g_idle += dt;
@@ -1077,6 +1281,7 @@ static void Draw(float W, float H, float dt) {
     switch (g_tab) {
         case kTabPlayer:  PagePlayer();  break;
         case kTabVehicle: PageVehicle(); break;
+        case kTabTeleport: PageTeleport(); break;
         case kTabGame:    PageGame();    break;
         case kTabCheats:  PageCheats();  break;
         default:          PageMenu();    break;
